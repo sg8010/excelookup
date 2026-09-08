@@ -67,7 +67,7 @@ fn end_to_end_left_join_real_xlsx() {
         left_keys: vec![0],
         right_keys: vec![0],
         right_pick: vec![1],
-        key_mode: KeyMode::Normalize,
+        key_mode: KeyMode::NORMALIZE,
     };
     let res = join(&left, &right, &spec);
     assert_eq!(res.table.headers, vec!["id", "姓名", "部门"]);
@@ -109,7 +109,7 @@ fn end_to_end_inner_join_real_xlsx() {
         left_keys: vec![0],
         right_keys: vec![0],
         right_pick: vec![1],
-        key_mode: KeyMode::Normalize,
+        key_mode: KeyMode::NORMALIZE,
     };
     let res = join(&left, &right, &spec);
     assert_eq!(res.table.row_count(), 2); // id 1,3 命中;2、9 被丢弃
@@ -176,7 +176,7 @@ fn end_to_end_same_file_two_sheets() {
         left_keys: vec![1], // 客户列
         right_keys: vec![0],
         right_pick: vec![1], // 城市
-        key_mode: KeyMode::Exact,
+        key_mode: KeyMode::EXACT,
     };
     let res = join(&orders, &customers, &spec);
     assert_eq!(res.table.headers, vec!["订单号", "客户", "金额", "城市"]);

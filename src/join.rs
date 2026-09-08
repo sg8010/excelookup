@@ -1,7 +1,7 @@
 //! Join 引擎:实现 VLOOKUP(left join)与 inner/right/full join
 //!
 //! 左表按「原列」输出;右表只输出「取值列」,避免键列重复。
-//! 键支持多列复合;归一化(trim、数字/文本互认)可配置。
+//! 键支持多列复合;归一化可配置:数字/文本互认+trim、中文/英文括号互认。
 
 use std::collections::HashMap;
 
@@ -34,13 +34,27 @@ impl JoinType {
     }
 }
 
-/// 键归一化策略
+/// 键归一化策略(两个独立开关,可任意组合)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyMode {
-    /// 精确:数字 1 与文本 "1" 视为不同
-    Exact,
-    /// 宽松:数字与同文本视为相同,并 trim 首尾空白
-    Normalize,
+pub struct KeyMode {
+    /// 宽松匹配:数字 1 与文本 "1" 视为相同,并 trim 首尾空白
+    pub number_text: bool,
+    /// 括号归一化:中文括号(（）【】｛｝)与英文括号([]{})互认
+    pub brackets: bool,
+}
+
+impl KeyMode {
+    /// 全部关闭:数字 1 与文本 "1" 视为不同,括号不归一化
+    pub const EXACT: Self = Self { number_text: false, brackets: false };
+    /// 仅数字/文本互认 + trim(不带括号归一化)
+    pub const NORMALIZE: Self = Self { number_text: true, brackets: false };
+}
+
+impl Default for KeyMode {
+    fn default() -> Self {
+        // 默认:两开关全开(数字/文本互认 + 括号归一化)
+        Self { number_text: true, brackets: true }
+    }
 }
 
 /// join 参数
@@ -69,6 +83,23 @@ pub struct JoinResult {
     pub out_rows: usize,
 }
 
+/// 中文括号 → 对应英文括号(括号归一化)
+fn fold_brackets(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '（' => '(',
+            '）' => ')',
+            '【' => '[',
+            '】' => ']',
+            '｛' => '{',
+            '｝' => '}',
+            '〔' => '(',
+            '〕' => ')',
+            other => other,
+        })
+        .collect()
+}
+
 /// 生成单列 key 片段
 fn key_part(v: &CellValue, mode: KeyMode) -> String {
     match v {
@@ -79,18 +110,30 @@ fn key_part(v: &CellValue, mode: KeyMode) -> String {
             } else {
                 n.to_string()
             };
-            match mode {
-                // 精确:数字加前缀,与文本区分
-                KeyMode::Exact => format!("N:{d}"),
+            if mode.number_text {
                 // 宽松:数字与同文本互认 → 与文本走同一格式
-                KeyMode::Normalize => format!("V:{d}"),
+                format!("V:{d}")
+            } else {
+                // 精确:数字加前缀,与文本区分
+                format!("N:{d}")
             }
         }
-        CellValue::Text(s) => match mode {
-            KeyMode::Exact => format!("S:{s}"),
-            // 宽松:trim 后与数字同格式
-            KeyMode::Normalize => format!("V:{}", s.trim()),
-        },
+        CellValue::Text(s) => {
+            let mut body: String = if mode.brackets {
+                fold_brackets(s)
+            } else {
+                s.clone()
+            };
+            if mode.number_text {
+                body = body.trim().to_string();
+            }
+            if mode.number_text {
+                // 宽松:trim 后与数字同格式
+                format!("V:{body}")
+            } else {
+                format!("S:{body}")
+            }
+        }
     }
 }
 
@@ -287,7 +330,7 @@ mod tests {
     fn left_join_vlookup() {
         let a = tbl(&["id", "name"], &[&["1", "alice"], &["2", "bob"], &["3", "carol"]]);
         let b = tbl(&["id", "dept"], &[&["1", "eng"], &["3", "ops"]]);
-        let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::Exact));
+        let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT));
         assert_eq!(r.table.headers, vec!["id", "name", "dept"]);
         assert_eq!(r.table.row_count(), 3);
         assert_eq!(r.table.cell(0, 2), Some(&CellValue::Text("eng".into())));
@@ -300,7 +343,7 @@ mod tests {
     fn inner_join_drops_unmatched() {
         let a = tbl(&["id"], &[&["1"], &["2"], &["3"]]);
         let b = tbl(&["id", "v"], &[&["2", "x"], &["3", "y"]]);
-        let r = join(&a, &b, &spec(JoinType::Inner, 0, 0, 1, KeyMode::Exact));
+        let r = join(&a, &b, &spec(JoinType::Inner, 0, 0, 1, KeyMode::EXACT));
         assert_eq!(r.table.row_count(), 2);
         assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("x".into())));
         assert_eq!(r.table.cell(1, 1), Some(&CellValue::Text("y".into())));
@@ -310,7 +353,7 @@ mod tests {
     fn right_join_keeps_right_order() {
         let a = tbl(&["id"], &[&["1"], &["2"]]);
         let b = tbl(&["id", "v"], &[&["9", "z"], &["2", "x"]]);
-        let r = join(&a, &b, &spec(JoinType::Right, 0, 0, 1, KeyMode::Exact));
+        let r = join(&a, &b, &spec(JoinType::Right, 0, 0, 1, KeyMode::EXACT));
         // 右表顺序:9(z, 左空) → 2(x)
         assert_eq!(r.table.row_count(), 2);
         assert_eq!(r.table.cell(0, 0), Some(&CellValue::Empty));
@@ -322,7 +365,7 @@ mod tests {
     fn full_join_keeps_right_only() {
         let a = tbl(&["id"], &[&["1"], &["2"]]);
         let b = tbl(&["id", "v"], &[&["2", "x"], &["9", "z"]]);
-        let r = join(&a, &b, &spec(JoinType::Full, 0, 0, 1, KeyMode::Exact));
+        let r = join(&a, &b, &spec(JoinType::Full, 0, 0, 1, KeyMode::EXACT));
         assert_eq!(r.table.row_count(), 3);
         assert_eq!(r.table.cell(2, 0), Some(&CellValue::Empty));
         assert_eq!(r.table.cell(2, 1), Some(&CellValue::Text("z".into())));
@@ -333,7 +376,7 @@ mod tests {
         // 右表同 key 两行 → left 行复制成两行(vlookup 对重复键取第一条,这里取全部)
         let a = tbl(&["id"], &[&["1"]]);
         let b = tbl(&["id", "v"], &[&["1", "a"], &["1", "b"]]);
-        let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::Exact));
+        let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT));
         assert_eq!(r.table.row_count(), 2);
         assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("a".into())));
         assert_eq!(r.table.cell(1, 1), Some(&CellValue::Text("b".into())));
@@ -351,7 +394,7 @@ mod tests {
                 left_keys: vec![0, 1],
                 right_keys: vec![0, 1],
                 right_pick: vec![2],
-                key_mode: KeyMode::Exact,
+                key_mode: KeyMode::EXACT,
             },
         );
         assert_eq!(r.table.row_count(), 1);
@@ -364,12 +407,12 @@ mod tests {
         let a = tbl(&["id"], &[&["123"]]); // 文本 123
         let mut tb = Table::new(vec!["id".into(), "v".into()]);
         tb.push_row(vec![CellValue::Number(123.0), CellValue::Text("num".into())]);
-        let r = join(&a, &tb, &spec(JoinType::Left, 0, 0, 1, KeyMode::Normalize));
+        let r = join(&a, &tb, &spec(JoinType::Left, 0, 0, 1, KeyMode::NORMALIZE));
         assert_eq!(r.table.row_count(), 1);
         assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("num".into())));
 
         // Exact 下数字 123 ≠ 文本 "123"
-        let r2 = join(&a, &tb, &spec(JoinType::Left, 0, 0, 1, KeyMode::Exact));
+        let r2 = join(&a, &tb, &spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT));
         assert_eq!(r2.table.cell(0, 1), Some(&CellValue::Empty));
     }
 
@@ -378,7 +421,7 @@ mod tests {
         // 左表空键行 → left 保留但右侧空
         let a = tbl(&["id"], &[&[""], &["1"]]);
         let b = tbl(&["id", "v"], &[&["1", "x"]]);
-        let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::Exact));
+        let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT));
         assert_eq!(r.table.row_count(), 2);
         assert_eq!(r.table.cell(0, 1), Some(&CellValue::Empty));
         assert_eq!(r.table.cell(1, 1), Some(&CellValue::Text("x".into())));
@@ -396,11 +439,49 @@ mod tests {
                 left_keys: vec![0],
                 right_keys: vec![0],
                 right_pick: vec![1, 2],
-                key_mode: KeyMode::Exact,
+                key_mode: KeyMode::EXACT,
             },
         );
         assert_eq!(r.table.headers, vec!["id", "x", "y"]);
         assert_eq!(r.table.row_count(), 1);
         assert_eq!(r.table.cell(0, 2), Some(&CellValue::Text("20".into())));
+    }
+
+    #[test]
+    fn bracket_fold_matches_chinese_english() {
+        // 开启括号归一化:中文（）与英文 () 互认
+        let a = tbl(&["name"], &[&["苹果（红）"]]);
+        let b = tbl(&["name", "v"], &[&["苹果(红)", "x"]]);
+        let m = KeyMode { number_text: false, brackets: true };
+        let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m));
+        assert_eq!(r.table.row_count(), 1);
+        assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("x".into())));
+
+        // 关闭括号归一化则不匹配
+        let m2 = KeyMode { number_text: false, brackets: false };
+        let r2 = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m2));
+        assert_eq!(r2.table.row_count(), 1);
+        assert_eq!(r2.table.cell(0, 1), Some(&CellValue::Empty));
+    }
+
+    #[test]
+    fn bracket_fold_covers_all_pairs() {
+        // 【】→[]、｛｝→{} 等成对折叠
+        let a = tbl(&["k"], &[&["型号【A】｛B｝〔C〕"]]);
+        let b = tbl(&["k", "v"], &[&["型号[A]{B}(C)", "hit"]]);
+        let m = KeyMode { number_text: false, brackets: true };
+        let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m));
+        assert_eq!(r.table.row_count(), 1);
+        assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("hit".into())));
+    }
+
+    #[test]
+    fn bracket_fold_independent_of_number_text() {
+        // 括号归一化与数字/文本互认是独立开关:开括号时数字仍精确
+        let a = tbl(&["id"], &[&["1（a）"]]);
+        let b = tbl(&["id", "v"], &[&["1(a)", "x"]]);
+        let m = KeyMode { number_text: false, brackets: true };
+        let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m));
+        assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("x".into())));
     }
 }

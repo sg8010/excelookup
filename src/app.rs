@@ -61,8 +61,10 @@ pub struct ExcelLookupApp {
     left_key_col: usize,
     right_key_col: usize,
     right_pick_cols: Vec<usize>,
-    /// UI 用的归一化开关(与 key_mode 对应)
+    /// UI 用的宽松匹配开关(数字/文本互认 + trim)
     normalize_keys: bool,
+    /// UI 用的括号归一化开关(中文/英文括号互认)
+    bracket_fold: bool,
     result: Option<JoinOutcome>,
     /// 延迟到帧末处理(避免借用冲突)
     pending_open: Option<(Side, PathBuf)>,
@@ -96,6 +98,7 @@ impl Default for ExcelLookupApp {
             right_key_col: 0,
             right_pick_cols: vec![],
             normalize_keys: true,
+            bracket_fold: true,
             result: None,
             pending_open: None,
             pending_save: false,
@@ -106,16 +109,13 @@ impl Default for ExcelLookupApp {
 impl ExcelLookupApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
-        let mut s = Self::default();
-        s.normalize_keys = true;
-        s
+        Self::default()
     }
 
     fn key_mode(&self) -> KeyMode {
-        if self.normalize_keys {
-            KeyMode::Normalize
-        } else {
-            KeyMode::Exact
+        KeyMode {
+            number_text: self.normalize_keys,
+            brackets: self.bracket_fold,
         }
     }
 
@@ -465,6 +465,7 @@ impl ExcelLookupApp {
         });
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut self.normalize_keys, "键宽松匹配(数字/文本互认,忽略首尾空格)");
+            ui.checkbox(&mut self.bracket_fold, "括号归一化(中文（）与英文()互认)");
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("B 取值列(要带出的列):");
