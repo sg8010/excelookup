@@ -2,7 +2,7 @@
 # 交叉编译 Windows x64 版 ExcelLookup
 # 依赖: mingw-w64 (sudo apt install -y gcc-mingw-w64-x86-64)
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 export PATH="$HOME/.cargo/bin:$PATH"
 # 代理(如需要)
