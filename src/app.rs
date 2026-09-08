@@ -109,6 +109,7 @@ impl Default for ExcelLookupApp {
 impl ExcelLookupApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
+        Self::configure_ui_style(&cc.egui_ctx);
         Self::default()
     }
 
@@ -281,17 +282,12 @@ impl eframe::App for ExcelLookupApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
             self.ui_header(ui);
-            ui.separator();
-            ui.add_space(4.0);
+            ui.add_space(8.0);
             self.ui_sources(ui);
-            ui.add_space(6.0);
-            ui.separator();
+            ui.add_space(8.0);
             self.ui_join_config(ui);
-            ui.add_space(4.0);
-            ui.separator();
+            ui.add_space(8.0);
             self.ui_stats(ui);
-            ui.separator();
-            self.ui_result_table(ui);
         });
 
         // 帧末处理延迟事件
@@ -306,9 +302,68 @@ impl eframe::App for ExcelLookupApp {
 }
 
 impl ExcelLookupApp {
+    /// 保持字号易读，同时让设置区的间距和控件高度更紧凑。
+    fn configure_ui_style(ctx: &egui::Context) {
+        ctx.all_styles_mut(|style| {
+            style.spacing.item_spacing = egui::vec2(8.0, 5.0);
+            style.spacing.button_padding = egui::vec2(10.0, 5.0);
+            style.spacing.interact_size = egui::vec2(32.0, 32.0);
+            style.spacing.icon_width = 20.0;
+            style.spacing.icon_width_inner = 14.0;
+            style.spacing.icon_spacing = 5.0;
+            style.spacing.combo_width = 160.0;
+            style.spacing.window_margin = egui::Margin::same(10);
+
+            style.text_styles.insert(
+                egui::TextStyle::Small,
+                egui::FontId::proportional(15.0),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Body,
+                egui::FontId::proportional(17.0),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Button,
+                egui::FontId::proportional(17.0),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Monospace,
+                egui::FontId::monospace(16.0),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Heading,
+                egui::FontId::proportional(24.0),
+            );
+        });
+    }
+
+    /// 统一的功能区容器，避免设置、结果等内容挤在一条横线上。
+    fn section_frame<R>(
+        ui: &mut egui::Ui,
+        title: &str,
+        hint: &str,
+        add_contents: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> egui::InnerResponse<R> {
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(10))
+            .fill(ui.visuals().faint_bg_color)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(title).strong().size(18.0));
+                    if !hint.is_empty() {
+                        ui.add_space(5.0);
+                        ui.weak(hint);
+                    }
+                });
+                ui.add_space(5.0);
+                add_contents(ui)
+            })
+    }
+
     fn ui_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("ExcelLookup — Excel 双表连接");
+            ui.heading("ExcelLookup");
+            ui.label(egui::RichText::new("Excel 双表连接").strong().size(18.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let has_res = self
                     .result
@@ -316,7 +371,10 @@ impl ExcelLookupApp {
                     .map(|r| r.err.is_none() && r.table.col_count() > 0)
                     .unwrap_or(false);
                 if ui
-                    .add_enabled(has_res, egui::Button::new("💾 导出结果…"))
+                    .add_enabled(
+                        has_res,
+                        egui::Button::new("💾 导出结果…").min_size(egui::vec2(150.0, 36.0)),
+                    )
                     .clicked()
                 {
                     self.pending_save = true;
@@ -326,9 +384,11 @@ impl ExcelLookupApp {
     }
 
     fn ui_sources(&mut self, ui: &mut egui::Ui) {
-        ui.columns(2, |cols| {
-            self.ui_source_card(&mut cols[0], Side::Left);
-            self.ui_source_card(&mut cols[1], Side::Right);
+        Self::section_frame(ui, "① 数据源", "分别加载主表和匹配表，可切换工作表", |ui| {
+            ui.columns(2, |cols| {
+                self.ui_source_card(&mut cols[0], Side::Left);
+                self.ui_source_card(&mut cols[1], Side::Right);
+            });
         });
     }
 
@@ -363,40 +423,54 @@ impl ExcelLookupApp {
             ),
         };
 
-        ui.group(|ui| {
-            ui.strong(title);
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                if ui.button(label).clicked() {
-                    self.pick_and_load(side);
-                }
-                // sheet 下拉(多 sheet 时显示)
-                if has_multi && !sheet_names.is_empty() {
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(8))
+            .fill(ui.visuals().window_fill())
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(title).strong().size(17.0));
+                    if info.is_some() && error.is_none() {
+                        ui.weak("已就绪");
+                    }
+
                     ui.separator();
-                    ui.label("工作表:");
-                    let cur = sheet_names.get(cur_idx).cloned().unwrap_or_default();
-                    egui::ComboBox::from_id_salt(match side {
-                        Side::Left => "l_sheet",
-                        Side::Right => "r_sheet",
-                    })
-                    .selected_text(cur)
-                    .width(120.0)
-                    .show_ui(ui, |ui| {
-                        for (i, n) in sheet_names.iter().enumerate() {
-                            if ui.selectable_label(i == cur_idx, n).clicked() {
-                                self.switch_sheet(side, i);
+                    let file_button_width = ui.available_width().clamp(160.0, 520.0);
+                    if ui
+                        .add_sized([file_button_width, 32.0], egui::Button::new(label))
+                        .clicked()
+                    {
+                        self.pick_and_load(side);
+                    }
+
+                    // sheet 下拉(多 sheet 时显示)
+                    if has_multi && !sheet_names.is_empty() {
+                        ui.separator();
+                        ui.label("工作表");
+                        let cur = sheet_names.get(cur_idx).cloned().unwrap_or_default();
+                        egui::ComboBox::from_id_salt(match side {
+                            Side::Left => "l_sheet",
+                            Side::Right => "r_sheet",
+                        })
+                        .selected_text(cur)
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            for (i, n) in sheet_names.iter().enumerate() {
+                                if ui.selectable_label(i == cur_idx, n).clicked() {
+                                    self.switch_sheet(side, i);
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
+                });
+
+                ui.add_space(3.0);
+                if let Some(info) = &info {
+                    ui.label(info);
+                }
+                if let Some(e) = &error {
+                    ui.colored_label(Color32::LIGHT_RED, e);
                 }
             });
-            if let Some(info) = &info {
-                ui.label(info);
-            }
-            if let Some(e) = &error {
-                ui.colored_label(Color32::LIGHT_RED, e);
-            }
-        });
     }
 
     fn left_label(&self) -> String {
@@ -439,69 +513,117 @@ impl ExcelLookupApp {
     }
 
     fn ui_join_config(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label("连接类型:");
-            egui::ComboBox::from_id_salt("join_type")
-                .selected_text(self.join_type.label())
-                .show_ui(ui, |ui| {
-                    for jt in JoinType::all() {
-                        ui.selectable_value(&mut self.join_type, jt, jt.label());
-                    }
+        Self::section_frame(ui, "② 连接设置", "定义连接方式、匹配键和结果列", |ui| {
+            ui.columns(3, |cols| {
+                cols[0].vertical(|ui| {
+                    ui.label(egui::RichText::new("连接类型").strong());
+                    ui.add_space(5.0);
+                    egui::ComboBox::from_id_salt("join_type")
+                        .selected_text(self.join_type.label())
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for jt in JoinType::all() {
+                                ui.selectable_value(&mut self.join_type, jt, jt.label());
+                            }
+                        });
                 });
 
-            ui.separator();
-            ui.label("A 键列(匹配列)");
-            {
-                let headers = self.left.cur_headers();
-                Self::col_combo(ui, "a_key", &headers, &mut self.left_key_col);
-            }
+                cols[1].vertical(|ui| {
+                    ui.label(egui::RichText::new("A 键列（匹配列）").strong());
+                    ui.add_space(5.0);
+                    let headers = self.left.cur_headers();
+                    Self::col_combo(ui, "a_key", &headers, &mut self.left_key_col);
+                });
 
+                cols[2].vertical(|ui| {
+                    ui.label(egui::RichText::new("B 键列（匹配列）").strong());
+                    ui.add_space(5.0);
+                    let headers = self.right.cur_headers();
+                    Self::col_combo(ui, "b_key", &headers, &mut self.right_key_col);
+                });
+            });
+
+            ui.add_space(6.0);
+            ui.columns(2, |cols| {
+                cols[0].vertical(|ui| {
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::same(7))
+                        .fill(ui.visuals().window_fill())
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("匹配规则").strong().size(16.0));
+                            ui.add_space(2.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(
+                                    &mut self.normalize_keys,
+                                    "键宽松匹配（数字/文本互认，忽略首尾空格）",
+                                );
+                                ui.checkbox(
+                                    &mut self.bracket_fold,
+                                    "括号归一化（中文（）与英文()互认）",
+                                );
+                            });
+                        });
+                });
+
+                cols[1].vertical(|ui| {
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::same(7))
+                        .fill(ui.visuals().window_fill())
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("输出列").strong().size(16.0));
+                            ui.add_space(2.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("B 取值列");
+                                let rc = self.right.cur_col_count();
+                                if rc == 0 {
+                                    ui.weak("加载 B 后可勾选");
+                                } else {
+                                    let headers = self.right.cur_headers();
+                                    for i in 0..rc {
+                                        if i == self.right_key_col {
+                                            continue;
+                                        }
+                                        let mut checked = self.right_pick_cols.contains(&i);
+                                        if ui.checkbox(&mut checked, &headers[i]).changed() {
+                                            if checked {
+                                                if !self.right_pick_cols.contains(&i) {
+                                                    self.right_pick_cols.push(i);
+                                                }
+                                            } else {
+                                                self.right_pick_cols.retain(|&c| c != i);
+                                            }
+                                        }
+                                    }
+                                    if self.right_pick_cols.is_empty() {
+                                        ui.weak("未选取值列，结果将只有 A 的列");
+                                    }
+                                }
+                            });
+                        });
+                });
+            });
+
+            ui.add_space(6.0);
             ui.separator();
-            ui.label("B 键列(匹配列)");
-            {
-                let headers = self.right.cur_headers();
-                Self::col_combo(ui, "b_key", &headers, &mut self.right_key_col);
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut self.normalize_keys, "键宽松匹配(数字/文本互认,忽略首尾空格)");
-            ui.checkbox(&mut self.bracket_fold, "括号归一化(中文（）与英文()互认)");
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("B 取值列(要带出的列):");
-            let rc = self.right.cur_col_count();
-            if rc == 0 {
-                ui.weak("(加载 B 后可勾选)");
-            } else {
-                let headers = self.right.cur_headers();
-                for i in 0..rc {
-                    if i == self.right_key_col {
-                        continue;
-                    }
-                    let mut checked = self.right_pick_cols.contains(&i);
-                    if ui.checkbox(&mut checked, &headers[i]).changed() {
-                        if checked {
-                            if !self.right_pick_cols.contains(&i) {
-                                self.right_pick_cols.push(i);
-                            }
-                        } else {
-                            self.right_pick_cols.retain(|&c| c != i);
-                        }
-                    }
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_sized(
+                        [140.0, 36.0],
+                        egui::Button::new(egui::RichText::new("▶  执行连接").strong()),
+                    )
+                    .clicked()
+                {
+                    self.run_join();
                 }
-                if self.right_pick_cols.is_empty() {
-                    ui.weak("(未选任何取值列 — 结果将只有 A 的列)");
+                if ui
+                    .add_sized([120.0, 36.0], egui::Button::new("↺  清空结果"))
+                    .clicked()
+                {
+                    self.result = None;
                 }
-            }
-        });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui.button("▶ 执行连接").clicked() {
-                self.run_join();
-            }
-            if ui.button("↺ 清空结果").clicked() {
-                self.result = None;
-            }
+                ui.weak("设置完成后执行连接");
+            });
         });
     }
 
@@ -519,6 +641,7 @@ impl ExcelLookupApp {
         let sel_text = headers.get(*sel).cloned().unwrap_or_default();
         egui::ComboBox::from_id_salt(id)
             .selected_text(sel_text)
+            .width(ui.available_width())
             .show_ui(ui, |ui| {
                 for (i, n) in headers.iter().enumerate() {
                     ui.selectable_value(sel, i, n);
@@ -527,28 +650,41 @@ impl ExcelLookupApp {
     }
 
     fn ui_stats(&self, ui: &mut egui::Ui) {
-        let Some(res) = &self.result else {
-            ui.weak("提示:加载 A/B 两个数据源,选键列后点「执行连接」。");
-            return;
-        };
-        if let Some(e) = &res.err {
-            ui.colored_label(Color32::LIGHT_RED, format!("⚠ {e}"));
-            return;
-        }
-        ui.horizontal_wrapped(|ui| {
-            ui.label(format!(
-                "{} | A {} 行 / 匹配 {} | B {} 行 / 命中 {} | 结果 {} 行",
-                res.join_type.label(),
-                res.left_total,
-                res.left_matched,
-                res.right_total,
-                res.right_matched_rows,
-                res.out_rows
-            ));
+        Self::section_frame(ui, "③ 连接结果", "查看命中统计、结果预览并导出文件", |ui| {
+            let Some(res) = &self.result else {
+                ui.weak("加载 A/B 两个数据源，选好键列后点击「执行连接」。");
+                return;
+            };
+            if let Some(e) = &res.err {
+                ui.colored_label(Color32::LIGHT_RED, format!("⚠ {e}"));
+                return;
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(res.join_type.label()).strong());
+                ui.separator();
+                ui.label(format!(
+                    "A：{} 行，匹配 {} 行",
+                    res.left_total, res.left_matched
+                ));
+                ui.separator();
+                ui.label(format!(
+                    "B：{} 行，命中 {} 行",
+                    res.right_total, res.right_matched_rows
+                ));
+                ui.separator();
+                ui.label(format!("结果：{} 行", res.out_rows));
+            });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("结果预览").strong().size(17.0));
+            ui.add_space(6.0);
+            self.ui_result_table(ui);
         });
     }
 
-    fn ui_result_table(&mut self, ui: &mut egui::Ui) {
+    fn ui_result_table(&self, ui: &mut egui::Ui) {
         let Some(res) = &self.result else { return };
         if res.err.is_some() || res.table.col_count() == 0 {
             return;

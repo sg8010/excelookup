@@ -90,6 +90,8 @@ src/
 ├── read_xlsx.rs   # 工作簿读取(多 Sheet)
 ├── join.rs        # join 引擎(Left/Inner/Right/Full、复合键、宽松匹配)
 └── export.rs      # 导出 xlsx
+build.rs           # Windows 目标时把 assets/icon.ico 嵌入 exe(交叉编译也生效)
+assets/            # icon.png(窗口/任务栏图标)、icon.ico(exe 图标资源)
 tests/end_to_end.rs  # 真实文件端到端测试
 ```
 
