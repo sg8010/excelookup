@@ -1,0 +1,38 @@
+name: CI Linux arm64
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-linux-arm64:
+    name: Build Linux arm64 (release)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Verify binary
+        run: |
+          file target/release/excelookup
+          du -h target/release/excelookup
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: excelookup-linux-arm64
+          path: target/release/excelookup
+          if-no-files-found: error
