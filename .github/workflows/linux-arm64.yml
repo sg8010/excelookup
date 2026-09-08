@@ -6,6 +6,9 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-linux-arm64:
     name: Build Linux arm64 (release)
@@ -36,3 +39,25 @@ jobs:
           name: excelookup-linux-arm64
           path: target/release/excelookup
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-linux-arm64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: excelookup-linux-arm64
+          path: dist
+
+      - name: Prepare binary
+        run: |
+          chmod +x dist/excelookup
+          mv dist/excelookup dist/excelookup-linux-arm64
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/excelookup-linux-arm64
+          generate_release_notes: true
