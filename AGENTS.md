@@ -4,6 +4,7 @@ ExcelLookup:Rust + egui/eframe 0.36 的 Excel 双表 Join GUI。交付 Linux arm
 
 ## 约定(代码看不出来)
 
+- **GUI 改动后的端到端验证由用户手动测试**,不要写程序自动截图/自动加载数据来验证 UI(徒增调试代码,绕远路)。core 逻辑(lib 层)仍需 cargo test
 - **所有用户可见文案必须中文**(产品名、A/B、VLOOKUP 除外)
 - join/read/export 是纯逻辑 lib(`excelookup_lib`),**不得依赖 GUI**;新功能先 lib+单测再接 UI
 - `egui::FontData` 需包 `Arc`;egui 默认无 CJK → `app.rs::install_cjk_font()` 运行时加载系统字体,勿内嵌大字体
