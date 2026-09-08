@@ -557,37 +557,69 @@ impl ExcelLookupApp {
         let ncols = table.col_count();
         let row_count = table.row_count();
 
-        let avail = ui.available_height().max(100.0);
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(true)
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::auto().at_least(60.0).clip(true))
-                    .columns(Column::auto().at_least(60.0).clip(true), ncols)
-                    .header(24.0, |mut header| {
-                        for h in &headers {
-                            header.col(|ui| {
-                                ui.strong(h);
-                            });
-                        }
-                    })
-                    .body(|body| {
-                        body.rows(avail, row_count, |mut row| {
-                            let ridx = row.index();
-                            for c in 0..ncols {
-                                row.col(|ui| {
-                                    let v = table
-                                        .cell(ridx, c)
-                                        .map(CellValue::display)
-                                        .unwrap_or_default();
-                                    ui.label(v);
-                                });
+        // 紧凑行高:正文行高 + 少量内边距,避免每行过高
+        let text_h = ui.text_style_height(&egui::TextStyle::Body);
+        let row_h = (text_h + 6.0).max(20.0);
+
+        // 网格线颜色:用控件边框色(自动适配明/暗主题)
+        let sep_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+        let sep_width = 1.0;
+
+        // 表格自身带滚动,不再包外层 ScrollArea;
+        // 列宽:除最后一列外按内容自适应,最后一列占满剩余宽度(解决表格不铺满窗格)
+        let mut builder = TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .vscroll(true)
+            .max_scroll_height(f32::INFINITY);
+        if ncols >= 2 {
+            builder = builder
+                .columns(Column::auto().at_least(60.0).clip(true), ncols - 1)
+                .column(Column::remainder().at_least(80.0).clip(true));
+        } else {
+            builder = builder.columns(Column::auto().at_least(60.0).clip(true), ncols);
+        }
+
+        // 表头:底边加粗分隔线
+        builder
+            .header(row_h, |mut header| {
+                for h in &headers {
+                    header.col(|ui| {
+                        ui.strong(h);
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(row_h, row_count, |mut row| {
+                    let ridx = row.index();
+                    for c in 0..ncols {
+                        row.col(|ui| {
+                            let v = table
+                                .cell(ridx, c)
+                                .map(CellValue::display)
+                                .unwrap_or_default();
+                            ui.label(v);
+
+                            // 在单元格自身 ui 上画网格线(借用安全):
+                            // 底横线 + (非末列)右侧竖线
+                            let rect = ui.max_rect();
+                            let painter = ui.painter();
+                            painter.hline(
+                                rect.x_range(),
+                                rect.bottom(),
+                                egui::Stroke::new(sep_width, sep_color),
+                            );
+                            if c < ncols - 1 {
+                                painter.vline(
+                                    rect.right(),
+                                    rect.y_range(),
+                                    egui::Stroke::new(sep_width, sep_color),
+                                );
                             }
                         });
-                    });
+                    }
+                });
             });
     }
 }
