@@ -121,3 +121,77 @@ fn end_to_end_inner_join_real_xlsx() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
 }
+
+/// 同一 Excel 文件的两个 sheet 互 join(订单表 + 客户表)
+#[test]
+fn end_to_end_same_file_two_sheets() {
+    let dir = std::env::temp_dir();
+    let path = dir.join("exlook_it_samefile.xlsx");
+
+    // 造文件:sheet1 订单,sheet2 客户
+    {
+        let mut wb = Workbook::new();
+        {
+            let s = wb.add_worksheet();
+            s.set_name("订单").unwrap();
+            for (i, h) in ["订单号", "客户", "金额"].iter().enumerate() {
+                s.write_string(0, i as u16, *h).unwrap();
+            }
+            for (r, row) in [("A001", "张三", "100"), ("A002", "李四", "250"), ("A003", "王五", "80")]
+                .iter()
+                .enumerate()
+            {
+                s.write_string((r + 1) as u32, 0, row.0).unwrap();
+                s.write_string((r + 1) as u32, 1, row.1).unwrap();
+                s.write_string((r + 1) as u32, 2, row.2).unwrap();
+            }
+        }
+        {
+            let s = wb.add_worksheet();
+            s.set_name("客户").unwrap();
+            for (i, h) in ["客户", "城市"].iter().enumerate() {
+                s.write_string(0, i as u16, *h).unwrap();
+            }
+            for (r, row) in [("张三", "北京"), ("李四", "上海"), ("赵六", "广州")].iter().enumerate() {
+                s.write_string((r + 1) as u32, 0, row.0).unwrap();
+                s.write_string((r + 1) as u32, 1, row.1).unwrap();
+            }
+        }
+        wb.save(&path).unwrap();
+    }
+
+    // 读回:两个 sheet 都应存在
+    let sheets = read_workbook(&path).unwrap();
+    assert_eq!(sheets.len(), 2);
+    let find = |n: &str| sheets.iter().find(|(x, _)| x == n).unwrap().1.clone();
+    let orders = find("订单");
+    let customers = find("客户");
+    assert_eq!(orders.headers, vec!["订单号", "客户", "金额"]);
+    assert_eq!(orders.row_count(), 3);
+    assert_eq!(customers.headers, vec!["客户", "城市"]);
+
+    // join:订单.客户 = 客户.客户,取城市
+    let spec = JoinSpec {
+        join_type: JoinType::Left,
+        left_keys: vec![1], // 客户列
+        right_keys: vec![0],
+        right_pick: vec![1], // 城市
+        key_mode: KeyMode::Exact,
+    };
+    let res = join(&orders, &customers, &spec);
+    assert_eq!(res.table.headers, vec!["订单号", "客户", "金额", "城市"]);
+    assert_eq!(res.table.row_count(), 3); // 左表全保留
+    assert_eq!(
+        res.table.cell(0, 3),
+        Some(&CellValue::Text("北京".into()))
+    );
+    assert_eq!(
+        res.table.cell(1, 3),
+        Some(&CellValue::Text("上海".into()))
+    );
+    // 王五未在客户表 → 城市空
+    assert_eq!(res.table.cell(2, 3), Some(&CellValue::Empty));
+    assert_eq!(res.left_matched, 2);
+
+    let _ = std::fs::remove_file(&path);
+}

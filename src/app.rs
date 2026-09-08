@@ -8,19 +8,22 @@ use egui_extras::{Column, TableBuilder};
 use excelookup_lib::join::{join, JoinSpec, JoinType, KeyMode};
 use excelookup_lib::model::{CellValue, Table};
 
-/// 一个已打开的数据源(文件 + 当前 sheet 的表)
+/// 一个已打开的数据源(文件 + sheets)
 #[derive(Default, Clone)]
 struct Source {
     path: Option<PathBuf>,
-    /// 当前 sheet 名
-    sheet_name: String,
-    table: Table,
+    /// 所有 sheet 名(工作簿顺序)
+    sheet_names: Vec<String>,
+    /// 所有 sheet 数据(与 sheet_names 对齐)
+    sheets: Vec<Table>,
+    /// 当前 sheet 下标
+    sheet_idx: usize,
     error: Option<String>,
 }
 
 impl Source {
     fn is_loaded(&self) -> bool {
-        self.table.col_count() > 0
+        !self.sheets.is_empty()
     }
     fn label(&self) -> String {
         self.path
@@ -28,6 +31,26 @@ impl Source {
             .and_then(|p| p.file_name())
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default()
+    }
+    /// 当前 sheet 名
+    fn cur_sheet_name(&self) -> &str {
+        self.sheet_names
+            .get(self.sheet_idx)
+            .map(|s| s.as_str())
+            .unwrap_or("")
+    }
+    /// 当前 sheet 表
+    fn cur_table(&self) -> Option<&Table> {
+        self.sheets.get(self.sheet_idx)
+    }
+    fn cur_col_count(&self) -> usize {
+        self.cur_table().map(|t| t.col_count()).unwrap_or(0)
+    }
+    fn cur_row_count(&self) -> usize {
+        self.cur_table().map(|t| t.row_count()).unwrap_or(0)
+    }
+    fn cur_headers(&self) -> Vec<String> {
+        self.cur_table().map(|t| t.headers.clone()).unwrap_or_default()
     }
 }
 
@@ -114,14 +137,20 @@ impl ExcelLookupApp {
         src.error = None;
         match excelookup_lib::read_xlsx::read_workbook(&path) {
             Ok(sheets) => {
-                let mut sheets = sheets;
-                if let Some(idx) = sheets.iter().position(|(_, t)| !t.is_empty()) {
-                    let (name, table) = sheets.remove(idx);
-                    src.path = Some(path);
-                    src.sheet_name = name;
-                    src.table = table;
-                } else {
-                    src.error = Some("工作簿中无数据".into());
+                // 至少保留一个(即使全空也存,便于用户切换看到空表)
+                if sheets.is_empty() {
+                    src.error = Some("工作簿中无工作表".into());
+                    return;
+                }
+                let names: Vec<String> = sheets.iter().map(|(n, _)| n.clone()).collect();
+                let tables: Vec<Table> = sheets.into_iter().map(|(_, t)| t).collect();
+                src.path = Some(path);
+                src.sheet_names = names;
+                src.sheets = tables;
+                src.sheet_idx = 0;
+                // 跳到第一个非空 sheet
+                if let Some(idx) = src.sheets.iter().position(|t| !t.is_empty()) {
+                    src.sheet_idx = idx;
                 }
             }
             Err(e) => {
@@ -132,9 +161,23 @@ impl ExcelLookupApp {
         self.result = None;
     }
 
+    /// 切换 sheet(切换后清结果、校正键列)
+    fn switch_sheet(&mut self, side: Side, idx: usize) {
+        let src = match side {
+            Side::Left => &mut self.left,
+            Side::Right => &mut self.right,
+        };
+        if idx >= src.sheets.len() {
+            return;
+        }
+        src.sheet_idx = idx;
+        self.clamp_defaults();
+        self.result = None;
+    }
+
     fn clamp_defaults(&mut self) {
-        let lc = self.left.table.col_count();
-        let rc = self.right.table.col_count();
+        let lc = self.left.cur_col_count();
+        let rc = self.right.cur_col_count();
         if lc > 0 && self.left_key_col >= lc {
             self.left_key_col = 0;
         }
@@ -163,8 +206,28 @@ impl ExcelLookupApp {
             });
             return;
         }
-        let lc = self.left.table.col_count();
-        let rc = self.right.table.col_count();
+        // 当前 sheet 的借用分离:先取引用
+        let Some(left_t) = self.left.cur_table() else {
+            return;
+        };
+        let Some(right_t) = self.right.cur_table() else {
+            return;
+        };
+        let lc = left_t.col_count();
+        let rc = right_t.col_count();
+        if lc == 0 || rc == 0 {
+            self.result = Some(JoinOutcome {
+                table: Table::default(),
+                left_matched: 0,
+                left_total: 0,
+                right_matched_rows: 0,
+                right_total: 0,
+                out_rows: 0,
+                err: Some("当前 sheet 无列数据".into()),
+                join_type: self.join_type,
+            });
+            return;
+        }
         let lk = self.left_key_col.min(lc.saturating_sub(1));
         let rk = self.right_key_col.min(rc.saturating_sub(1));
         let rp: Vec<usize> = self
@@ -181,7 +244,7 @@ impl ExcelLookupApp {
             right_pick: rp,
             key_mode: self.key_mode(),
         };
-        let res = join(&self.left.table, &self.right.table, &spec);
+        let res = join(left_t, right_t, &spec);
         self.result = Some(JoinOutcome {
             table: res.table,
             left_matched: res.left_matched,
@@ -287,13 +350,46 @@ impl ExcelLookupApp {
                 self.right.error.clone(),
             ),
         };
+        let (sheet_names, cur_idx, has_multi): (Vec<String>, usize, bool) = match side {
+            Side::Left => (
+                self.left.sheet_names.clone(),
+                self.left.sheet_idx,
+                self.left.sheets.len() > 1,
+            ),
+            Side::Right => (
+                self.right.sheet_names.clone(),
+                self.right.sheet_idx,
+                self.right.sheets.len() > 1,
+            ),
+        };
 
         ui.group(|ui| {
             ui.strong(title);
             ui.add_space(2.0);
-            if ui.button(label).clicked() {
-                self.pick_and_load(side);
-            }
+            ui.horizontal(|ui| {
+                if ui.button(label).clicked() {
+                    self.pick_and_load(side);
+                }
+                // sheet 下拉(多 sheet 时显示)
+                if has_multi && !sheet_names.is_empty() {
+                    ui.separator();
+                    ui.label("Sheet:");
+                    let cur = sheet_names.get(cur_idx).cloned().unwrap_or_default();
+                    egui::ComboBox::from_id_salt(match side {
+                        Side::Left => "l_sheet",
+                        Side::Right => "r_sheet",
+                    })
+                    .selected_text(cur)
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        for (i, n) in sheet_names.iter().enumerate() {
+                            if ui.selectable_label(i == cur_idx, n).clicked() {
+                                self.switch_sheet(side, i);
+                            }
+                        }
+                    });
+                }
+            });
             if let Some(info) = &info {
                 ui.label(info);
             }
@@ -305,27 +401,41 @@ impl ExcelLookupApp {
 
     fn left_label(&self) -> String {
         if self.left.is_loaded() {
-            format!("📄 {} / [{}]", self.left.label(), self.left.sheet_name)
+            format!("📄 {}", self.left.label())
         } else {
             "选择 Excel 文件…".into()
         }
     }
     fn right_label(&self) -> String {
         if self.right.is_loaded() {
-            format!("📄 {} / [{}]", self.right.label(), self.right.sheet_name)
+            format!("📄 {}", self.right.label())
         } else {
             "选择 Excel 文件…".into()
         }
     }
     fn left_info(&self) -> Option<String> {
-        self.left
-            .is_loaded()
-            .then(|| format!("{} 行 × {} 列", self.left.table.row_count(), self.left.table.col_count()))
+        if !self.left.is_loaded() {
+            return None;
+        }
+        Some(format!(
+            "Sheet [{}]: {} 行 × {} 列 (共 {} sheets)",
+            self.left.cur_sheet_name(),
+            self.left.cur_row_count(),
+            self.left.cur_col_count(),
+            self.left.sheets.len()
+        ))
     }
     fn right_info(&self) -> Option<String> {
-        self.right
-            .is_loaded()
-            .then(|| format!("{} 行 × {} 列", self.right.table.row_count(), self.right.table.col_count()))
+        if !self.right.is_loaded() {
+            return None;
+        }
+        Some(format!(
+            "Sheet [{}]: {} 行 × {} 列 (共 {} sheets)",
+            self.right.cur_sheet_name(),
+            self.right.cur_row_count(),
+            self.right.cur_col_count(),
+            self.right.sheets.len()
+        ))
     }
 
     fn ui_join_config(&mut self, ui: &mut egui::Ui) {
@@ -342,14 +452,14 @@ impl ExcelLookupApp {
             ui.separator();
             ui.label("A 键列");
             {
-                let headers = self.left.table.headers.clone();
+                let headers = self.left.cur_headers();
                 Self::col_combo(ui, "a_key", &headers, &mut self.left_key_col);
             }
 
             ui.separator();
             ui.label("B 键列");
             {
-                let headers = self.right.table.headers.clone();
+                let headers = self.right.cur_headers();
                 Self::col_combo(ui, "b_key", &headers, &mut self.right_key_col);
             }
         });
@@ -358,11 +468,11 @@ impl ExcelLookupApp {
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("B 取值列:");
-            let rc = self.right.table.col_count();
+            let rc = self.right.cur_col_count();
             if rc == 0 {
                 ui.weak("(加载 B 后可勾选)");
             } else {
-                let headers = self.right.table.headers.clone();
+                let headers = self.right.cur_headers();
                 for i in 0..rc {
                     if i == self.right_key_col {
                         continue;
