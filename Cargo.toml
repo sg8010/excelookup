@@ -3,10 +3,18 @@ name = "excelookup"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "excelookup_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "excelookup"
+path = "src/main.rs"
+
 [dependencies]
-anyhow = "1.0.104"
-calamine = "0.36.1"
-eframe = "0.36.1"
-egui_extras = "0.36.1"
-rfd = "0.17.2"
-rust_xlsxwriter = "0.99.0"
+eframe = "0.36"
+egui_extras = "0.36"
+calamine = "0.36"
+rust_xlsxwriter = "0.99"
+rfd = "0.17"
+anyhow = "1"
