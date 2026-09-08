@@ -25,7 +25,7 @@ pub fn read_workbook(path: &Path) -> Result<Vec<(String, Table)>> {
     for name in &names {
         let range = workbook
             .worksheet_range(name)
-            .with_context(|| format!("读取 sheet「{}」失败", name))?;
+            .with_context(|| format!("读取工作表「{}」失败", name))?;
         out.push((name.clone(), table_from_range(&range)));
     }
     Ok(out)

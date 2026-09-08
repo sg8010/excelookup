@@ -223,7 +223,7 @@ impl ExcelLookupApp {
                 right_matched_rows: 0,
                 right_total: 0,
                 out_rows: 0,
-                err: Some("当前 sheet 无列数据".into()),
+                err: Some("当前工作表无列数据".into()),
                 join_type: self.join_type,
             });
             return;
@@ -265,7 +265,7 @@ impl ExcelLookupApp {
         let table = res.table.clone();
         let picked = rfd::FileDialog::new()
             .add_filter("Excel 工作簿", &["xlsx"])
-            .set_file_name("join_result.xlsx")
+            .set_file_name("连接结果.xlsx")
             .save_file();
         if let Some(path) = picked {
             if let Err(e) = excelookup_lib::export::write_xlsx(&table, &path) {
@@ -308,7 +308,7 @@ impl eframe::App for ExcelLookupApp {
 impl ExcelLookupApp {
     fn ui_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("ExcelLookup — Excel 双表 Join");
+            ui.heading("ExcelLookup — Excel 双表连接");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let has_res = self
                     .result
@@ -373,7 +373,7 @@ impl ExcelLookupApp {
                 // sheet 下拉(多 sheet 时显示)
                 if has_multi && !sheet_names.is_empty() {
                     ui.separator();
-                    ui.label("Sheet:");
+                    ui.label("工作表:");
                     let cur = sheet_names.get(cur_idx).cloned().unwrap_or_default();
                     egui::ComboBox::from_id_salt(match side {
                         Side::Left => "l_sheet",
@@ -418,7 +418,7 @@ impl ExcelLookupApp {
             return None;
         }
         Some(format!(
-            "Sheet [{}]: {} 行 × {} 列 (共 {} sheets)",
+            "工作表 [{}]: {} 行 × {} 列 (共 {} 个工作表)",
             self.left.cur_sheet_name(),
             self.left.cur_row_count(),
             self.left.cur_col_count(),
@@ -430,7 +430,7 @@ impl ExcelLookupApp {
             return None;
         }
         Some(format!(
-            "Sheet [{}]: {} 行 × {} 列 (共 {} sheets)",
+            "工作表 [{}]: {} 行 × {} 列 (共 {} 个工作表)",
             self.right.cur_sheet_name(),
             self.right.cur_row_count(),
             self.right.cur_col_count(),
@@ -440,7 +440,7 @@ impl ExcelLookupApp {
 
     fn ui_join_config(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.label("Join:");
+            ui.label("连接类型:");
             egui::ComboBox::from_id_salt("join_type")
                 .selected_text(self.join_type.label())
                 .show_ui(ui, |ui| {
@@ -450,14 +450,14 @@ impl ExcelLookupApp {
                 });
 
             ui.separator();
-            ui.label("A 键列");
+            ui.label("A 键列(匹配列)");
             {
                 let headers = self.left.cur_headers();
                 Self::col_combo(ui, "a_key", &headers, &mut self.left_key_col);
             }
 
             ui.separator();
-            ui.label("B 键列");
+            ui.label("B 键列(匹配列)");
             {
                 let headers = self.right.cur_headers();
                 Self::col_combo(ui, "b_key", &headers, &mut self.right_key_col);
@@ -467,7 +467,7 @@ impl ExcelLookupApp {
             ui.checkbox(&mut self.normalize_keys, "键宽松匹配(数字/文本互认,忽略首尾空格)");
         });
         ui.horizontal_wrapped(|ui| {
-            ui.label("B 取值列:");
+            ui.label("B 取值列(要带出的列):");
             let rc = self.right.cur_col_count();
             if rc == 0 {
                 ui.weak("(加载 B 后可勾选)");
@@ -495,7 +495,7 @@ impl ExcelLookupApp {
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui.button("▶ 执行 Join").clicked() {
+            if ui.button("▶ 执行连接").clicked() {
                 self.run_join();
             }
             if ui.button("↺ 清空结果").clicked() {
@@ -527,7 +527,7 @@ impl ExcelLookupApp {
 
     fn ui_stats(&self, ui: &mut egui::Ui) {
         let Some(res) = &self.result else {
-            ui.weak("提示:加载 A/B 两个数据源,选键列后点「执行 Join」。");
+            ui.weak("提示:加载 A/B 两个数据源,选键列后点「执行连接」。");
             return;
         };
         if let Some(e) = &res.err {
