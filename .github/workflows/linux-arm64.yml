@@ -2,7 +2,6 @@ name: CI Linux arm64
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 
