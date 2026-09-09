@@ -12,9 +12,14 @@ name = "excelookup"
 path = "src/main.rs"
 
 [dependencies]
-eframe = "0.36"
+# Linux 目标仅需 X11 + glow(OpenGL) 渲染;关 default 去掉 wayland/wgpu/accesskit,
+# 使交叉编译容器无需 libwayland-dev 等系统开发库(x11 运行时 dlopen)。
+# accesskit(无障碍)会拉 accesskit_winit→winit/wayland→libwayland 硬链接,故不用。
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "links", "glow", "x11"] }
 egui_extras = "0.36"
 calamine = "0.36"
 rust_xlsxwriter = "0.99"
-rfd = "0.17"
+# rfd 关 default:去掉 wayland feature(仅用于 Wayland 父窗口标识,项目只跑 X11)。
+# 保留 xdg-portal(纯 zbus,无系统库依赖);X11 下窗口标识仍生效。
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 anyhow = "1"
