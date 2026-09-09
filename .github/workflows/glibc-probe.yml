@@ -20,9 +20,17 @@ jobs:
           uname -m
           whoami
 
+      - name: 切到 archive 源 (buster 已 EOL)
+        run: |
+          cat > /etc/apt/sources.list <<'EOF'
+deb http://archive.debian.org/debian/ buster main
+deb http://archive.debian.org/debian/ buster-updates main
+deb http://archive.debian.org/debian-security/ buster/updates main
+EOF
+          apt-get -o Acquire::Check-Valid-Until=false update
+
       - name: 装 rustup (buster 内)
         run: |
-          apt-get update
           apt-get install -y --no-install-recommends curl ca-certificates
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
