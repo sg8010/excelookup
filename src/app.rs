@@ -900,20 +900,6 @@ impl ExcelLookupApp {
             ui.label(egui::RichText::new("连接工作台").strong().color(Self::ink()));
             ui.label(egui::RichText::new("/").color(Self::soft()));
             ui.label(egui::RichText::new("新建连接").color(Self::muted()));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                ui.painter().circle_filled(rect.center(), 3.5, Self::teal());
-                ui.label(egui::RichText::new("本地运行中").size(14.0).color(Self::teal()));
-                ui.add_space(17.0);
-                let response = ui.add(
-                    egui::Button::new(egui::RichText::new("?").size(14.0).color(Self::muted()))
-                        .min_size(egui::vec2(26.0, 26.0))
-                        .fill(Color32::TRANSPARENT)
-                        .stroke(Stroke::NONE)
-                        .corner_radius(CornerRadius::ZERO),
-                );
-                response.on_hover_text("查看使用说明");
-            });
         });
     }
 
@@ -962,16 +948,7 @@ impl ExcelLookupApp {
                     if Self::green_button(ui, "导出结果  ↓", 136.0).clicked() {
                         self.pending_save = true;
                     }
-                    ui.add_space(16.0);
                 }
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("♢").size(18.0).color(Self::blue()));
-                    ui.label(
-                        egui::RichText::new("适用于 VLOOKUP 与多表合并")
-                            .size(13.0)
-                            .color(Self::muted()),
-                    );
-                });
             });
         });
     }
@@ -1291,82 +1268,57 @@ impl ExcelLookupApp {
         let left_headers = self.left.cur_headers();
         let right_headers = self.right.cur_headers();
         Self::sub_panel(ui, |ui| {
-            if ui.available_width() >= 700.0 {
-                ui.columns(3, |cols| {
-                    cols[0].vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("A 匹配列")
-                                .size(13.0)
-                                .strong()
-                                .color(Self::muted()),
-                        );
-                        ui.add_space(7.0);
-                        Self::col_combo(ui, "workflow_a_key", &left_headers, &mut self.left_key_col);
-                    });
-                    cols[1].vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("连接类型")
-                                .size(13.0)
-                                .strong()
-                                .color(Self::muted()),
-                        );
-                        ui.add_space(7.0);
-                        egui::ComboBox::from_id_salt("workflow_join_type")
-                            .selected_text(Self::join_type_short(self.join_type))
-                            .width(ui.available_width())
-                            .show_ui(ui, |ui| {
-                                for join_type in JoinType::all() {
-                                    ui.selectable_value(
-                                        &mut self.join_type,
-                                        join_type,
-                                        join_type.label(),
-                                    );
-                                }
-                            });
-                        ui.add_space(3.0);
-                        ui.label(
-                            egui::RichText::new(self.join_type.hint())
-                                .size(12.0)
-                                .color(Self::soft()),
-                        );
-                    });
-                    cols[2].vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("B 匹配列")
-                                .size(13.0)
-                                .strong()
-                                .color(Self::muted()),
-                        );
-                        ui.add_space(7.0);
-                        Self::col_combo(ui, "workflow_b_key", &right_headers, &mut self.right_key_col);
-                        // 键列不允许作为输出列:改了键,同步从输出列中剔除
-                        self.right_pick_cols.retain(|&c| Some(c) != self.right_key_col);
-                    });
+            ui.columns(3, |cols| {
+                cols[0].vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("A 匹配列")
+                            .size(13.0)
+                            .strong()
+                            .color(Self::muted()),
+                    );
+                    ui.add_space(7.0);
+                    Self::col_combo(ui, "workflow_a_key", &left_headers, &mut self.left_key_col);
                 });
-            } else {
-                ui.label(egui::RichText::new("A 匹配列").strong().color(Self::muted()));
-                Self::col_combo(ui, "workflow_a_key_small", &left_headers, &mut self.left_key_col);
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new("连接类型").strong().color(Self::muted()));
-                egui::ComboBox::from_id_salt("workflow_join_type_small")
-                    .selected_text(self.join_type.label())
-                    .width(ui.available_width())
-                    .show_ui(ui, |ui| {
-                        for join_type in JoinType::all() {
-                            ui.selectable_value(&mut self.join_type, join_type, join_type.label());
-                        }
-                    });
-                ui.label(
-                    egui::RichText::new(self.join_type.hint())
-                        .size(12.0)
-                        .color(Self::soft()),
-                );
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new("B 匹配列").strong().color(Self::muted()));
-                Self::col_combo(ui, "workflow_b_key_small", &right_headers, &mut self.right_key_col);
-                // 键列不允许作为输出列:改了键,同步从输出列中剔除
-                self.right_pick_cols.retain(|&c| Some(c) != self.right_key_col);
-            }
+                cols[1].vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("连接类型")
+                            .size(13.0)
+                            .strong()
+                            .color(Self::muted()),
+                    );
+                    ui.add_space(7.0);
+                    egui::ComboBox::from_id_salt("workflow_join_type")
+                        .selected_text(self.join_type.label())
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for join_type in JoinType::all() {
+                                ui.selectable_value(
+                                    &mut self.join_type,
+                                    join_type,
+                                    join_type.label(),
+                                );
+                            }
+                        });
+                    ui.add_space(3.0);
+                    ui.label(
+                        egui::RichText::new(self.join_type.hint())
+                            .size(12.0)
+                            .color(Self::soft()),
+                    );
+                });
+                cols[2].vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("B 匹配列")
+                            .size(13.0)
+                            .strong()
+                            .color(Self::muted()),
+                    );
+                    ui.add_space(7.0);
+                    Self::col_combo(ui, "workflow_b_key", &right_headers, &mut self.right_key_col);
+                    // 键列不允许作为输出列:改了键,同步从输出列中剔除
+                    self.right_pick_cols.retain(|&c| Some(c) != self.right_key_col);
+                });
+            });
         });
 
         ui.add_space(13.0);
@@ -1448,13 +1400,6 @@ impl ExcelLookupApp {
                 self.clear_result();
             }
         });
-    }
-
-    fn join_type_short(join_type: JoinType) -> &'static str {
-        match join_type {
-            JoinType::Left => "左连接",
-            JoinType::Inner => "内连接",
-        }
     }
 
     fn col_combo(ui: &mut egui::Ui, id: &str, headers: &[String], sel: &mut Option<usize>) {

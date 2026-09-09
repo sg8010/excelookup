@@ -19,8 +19,8 @@ pub enum JoinType {
 impl JoinType {
     pub fn label(&self) -> &'static str {
         match self {
-            JoinType::Left => "左连接(VLOOKUP)",
-            JoinType::Inner => "内连接(交集)",
+            JoinType::Left => "左连接（VLOOKUP）",
+            JoinType::Inner => "内连接（交集）",
         }
     }
     pub fn all() -> [JoinType; 2] {
