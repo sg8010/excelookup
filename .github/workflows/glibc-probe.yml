@@ -22,11 +22,11 @@ jobs:
 
       - name: 切到 archive 源 (buster 已 EOL)
         run: |
-          cat > /etc/apt/sources.list <<'EOF'
-deb http://archive.debian.org/debian/ buster main
-deb http://archive.debian.org/debian/ buster-updates main
-deb http://archive.debian.org/debian-security/ buster/updates main
-EOF
+          printf '%s\n' \
+            'deb http://archive.debian.org/debian/ buster main' \
+            'deb http://archive.debian.org/debian/ buster-updates main' \
+            'deb http://archive.debian.org/debian-security/ buster/updates main' \
+            > /etc/apt/sources.list
           apt-get -o Acquire::Check-Valid-Until=false update
 
       - name: 装 rustup (buster 内)
