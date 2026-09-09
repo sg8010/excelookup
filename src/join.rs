@@ -32,6 +32,16 @@ impl JoinType {
     pub fn all() -> [JoinType; 4] {
         [JoinType::Left, JoinType::Inner, JoinType::Right, JoinType::Full]
     }
+
+    /// 语义说明:每种连接类型对 A/B 两侧行的去留
+    pub fn hint(&self) -> &'static str {
+        match self {
+            JoinType::Left => "保留 A 的全部行",
+            JoinType::Inner => "仅保留 A、B 都能匹配到的行",
+            JoinType::Right => "保留 B 的全部行",
+            JoinType::Full => "保留 A、B 的全部行",
+        }
+    }
 }
 
 /// 键归一化策略(两个独立开关,可任意组合)

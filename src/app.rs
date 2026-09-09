@@ -1195,12 +1195,17 @@ impl ExcelLookupApp {
                         ui.add_space(7.0);
                         Self::col_combo(ui, "workflow_a_key", &left_headers, &mut self.left_key_col);
                     });
-                    cols[1].vertical_centered(|ui| {
-                        ui.add_space(10.0);
-                        ui.label(egui::RichText::new("→").size(24.0).color(Self::blue()));
+                    cols[1].vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("连接类型")
+                                .size(13.0)
+                                .strong()
+                                .color(Self::muted()),
+                        );
+                        ui.add_space(7.0);
                         egui::ComboBox::from_id_salt("workflow_join_type")
                             .selected_text(Self::join_type_short(self.join_type))
-                            .width(112.0)
+                            .width(ui.available_width())
                             .show_ui(ui, |ui| {
                                 for join_type in JoinType::all() {
                                     ui.selectable_value(
@@ -1210,8 +1215,9 @@ impl ExcelLookupApp {
                                     );
                                 }
                             });
+                        ui.add_space(3.0);
                         ui.label(
-                            egui::RichText::new("保留 A 的全部行")
+                            egui::RichText::new(self.join_type.hint())
                                 .size(12.0)
                                 .color(Self::soft()),
                         );
@@ -1240,6 +1246,11 @@ impl ExcelLookupApp {
                             ui.selectable_value(&mut self.join_type, join_type, join_type.label());
                         }
                     });
+                ui.label(
+                    egui::RichText::new(self.join_type.hint())
+                        .size(12.0)
+                        .color(Self::soft()),
+                );
                 ui.add_space(10.0);
                 ui.label(egui::RichText::new("B 匹配列").strong().color(Self::muted()));
                 Self::col_combo(ui, "workflow_b_key_small", &right_headers, &mut self.right_key_col);
@@ -1568,12 +1579,14 @@ impl ExcelLookupApp {
         let text_h = ui.text_style_height(&egui::TextStyle::Body);
         let row_h = (text_h + 7.0).max(22.0);
         let sep_color = Self::line();
-        // 预览表只读：关闭每个单元格的 hover 命中和列拖拽检测，避免鼠标移动时
-        // 对整张表重复做大量交互命中计算。
+        // 预览表允许拖拽列宽（表头分隔线），便于展开长文本列；
+        // 命中区仅在表头细线处，代价可忽略。
         let mut builder = TableBuilder::new(ui)
             .striped(true)
-            .resizable(false)
-            .sense(egui::Sense::empty())
+            .resizable(true)
+            // 必须有 click/drag 位才有真正 hover 感应（egui 0.36 Sense::hover() 为空）；
+            // 行内格子 hover 后由 egui_extras 自动整行高亮（用于长行横向对位）。
+            .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .vscroll(true)
             .max_scroll_height(300.0);
