@@ -21,8 +21,8 @@ fn app_icon() -> Option<Arc<egui::IconData>> {
 
 fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1180.0, 780.0])
-        .with_min_inner_size([800.0, 560.0]);
+        .with_inner_size([1280.0, 820.0])
+        .with_min_inner_size([900.0, 600.0]);
     if let Some(icon) = app_icon() {
         viewport = viewport.with_icon(icon);
     }

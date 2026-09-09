@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use eframe::egui::{self, Color32};
+use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke};
 use egui_extras::{Column, TableBuilder};
 
 use excelookup_lib::join::{join, JoinSpec, JoinType, KeyMode};
@@ -25,6 +25,7 @@ impl Source {
     fn is_loaded(&self) -> bool {
         !self.sheets.is_empty()
     }
+
     fn label(&self) -> String {
         self.path
             .as_ref()
@@ -32,31 +33,38 @@ impl Source {
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default()
     }
-    /// 当前 sheet 名
+
     fn cur_sheet_name(&self) -> &str {
         self.sheet_names
             .get(self.sheet_idx)
             .map(|s| s.as_str())
             .unwrap_or("")
     }
-    /// 当前 sheet 表
+
     fn cur_table(&self) -> Option<&Table> {
         self.sheets.get(self.sheet_idx)
     }
+
     fn cur_col_count(&self) -> usize {
         self.cur_table().map(|t| t.col_count()).unwrap_or(0)
     }
+
     fn cur_row_count(&self) -> usize {
         self.cur_table().map(|t| t.row_count()).unwrap_or(0)
     }
+
     fn cur_headers(&self) -> Vec<String> {
-        self.cur_table().map(|t| t.headers.clone()).unwrap_or_default()
+        self.cur_table()
+            .map(|t| t.headers.clone())
+            .unwrap_or_default()
     }
 }
 
 pub struct ExcelLookupApp {
     left: Source,
     right: Source,
+    /// 当前工作流步骤:主工作区一次只展示一个步骤。
+    step: WorkflowStep,
     join_type: JoinType,
     left_key_col: usize,
     right_key_col: usize,
@@ -66,6 +74,8 @@ pub struct ExcelLookupApp {
     /// UI 用的括号归一化开关(中文/英文括号互认)
     bracket_fold: bool,
     result: Option<JoinOutcome>,
+    /// 结果预览中的文本筛选条件(仅影响 UI,不改变导出内容)。
+    result_filter: String,
     /// 延迟到帧末处理(避免借用冲突)
     pending_open: Option<(Side, PathBuf)>,
     pending_save: bool,
@@ -88,11 +98,53 @@ enum Side {
     Right,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkflowStep {
+    Sources,
+    Configure,
+    Result,
+}
+
+impl WorkflowStep {
+    fn number(self) -> usize {
+        match self {
+            Self::Sources => 1,
+            Self::Configure => 2,
+            Self::Result => 3,
+        }
+    }
+
+    fn eyebrow(self) -> &'static str {
+        match self {
+            Self::Sources => "第一步 · 数据源",
+            Self::Configure => "第二步 · 连接配置",
+            Self::Result => "第三步 · 结果预览",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Sources => "先把要连接的两张表放在一起",
+            Self::Configure => "选择两张表如何对齐",
+            Self::Result => "检查结果，确认后导出",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Sources => "文件只在本机读取，确认工作表后进入连接配置。",
+            Self::Configure => "选中匹配列，再确定需要带出的字段。",
+            Self::Result => "先看命中情况，再保存为新的工作簿。",
+        }
+    }
+}
+
 impl Default for ExcelLookupApp {
     fn default() -> Self {
         Self {
             left: Source::default(),
             right: Source::default(),
+            step: WorkflowStep::Sources,
             join_type: JoinType::Left,
             left_key_col: 0,
             right_key_col: 0,
@@ -100,6 +152,7 @@ impl Default for ExcelLookupApp {
             normalize_keys: true,
             bracket_fold: true,
             result: None,
+            result_filter: String::new(),
             pending_open: None,
             pending_save: false,
         }
@@ -126,6 +179,7 @@ impl ExcelLookupApp {
             .add_filter("所有文件", &["*"])
             .pick_file();
         if let Some(p) = picked {
+            self.step = WorkflowStep::Sources;
             self.pending_open = Some((side, p));
         }
     }
@@ -160,6 +214,7 @@ impl ExcelLookupApp {
         }
         self.clamp_defaults();
         self.result = None;
+        self.result_filter.clear();
     }
 
     /// 切换 sheet(切换后清结果、校正键列)
@@ -174,6 +229,10 @@ impl ExcelLookupApp {
         src.sheet_idx = idx;
         self.clamp_defaults();
         self.result = None;
+        self.result_filter.clear();
+        if self.step == WorkflowStep::Result {
+            self.step = WorkflowStep::Configure;
+        }
     }
 
     fn clamp_defaults(&mut self) {
@@ -205,8 +264,10 @@ impl ExcelLookupApp {
                 err: Some("请先加载两个数据源".into()),
                 join_type: self.join_type,
             });
+            self.step = WorkflowStep::Configure;
             return;
         }
+
         // 当前 sheet 的借用分离:先取引用
         let Some(left_t) = self.left.cur_table() else {
             return;
@@ -227,6 +288,7 @@ impl ExcelLookupApp {
                 err: Some("当前工作表无列数据".into()),
                 join_type: self.join_type,
             });
+            self.step = WorkflowStep::Configure;
             return;
         }
         let lk = self.left_key_col.min(lc.saturating_sub(1));
@@ -256,6 +318,8 @@ impl ExcelLookupApp {
             err: None,
             join_type: self.join_type,
         });
+        self.result_filter.clear();
+        self.step = WorkflowStep::Result;
     }
 
     fn export(&mut self) {
@@ -276,19 +340,93 @@ impl ExcelLookupApp {
             }
         }
     }
+
+    fn clear_result(&mut self) {
+        self.result = None;
+        self.result_filter.clear();
+        if self.sources_ready() {
+            self.step = WorkflowStep::Configure;
+        }
+    }
+
+    fn clear_sources(&mut self) {
+        self.left = Source::default();
+        self.right = Source::default();
+        self.left_key_col = 0;
+        self.right_key_col = 0;
+        self.right_pick_cols.clear();
+        self.result = None;
+        self.result_filter.clear();
+        self.step = WorkflowStep::Sources;
+    }
+
+    fn sources_ready(&self) -> bool {
+        self.left.is_loaded()
+            && self.right.is_loaded()
+            && self.left.error.is_none()
+            && self.right.error.is_none()
+    }
+
+    fn result_ready(&self) -> bool {
+        self.result
+            .as_ref()
+            .map(|r| r.err.is_none() && r.table.col_count() > 0)
+            .unwrap_or(false)
+    }
+
+    fn can_enter_step(&self, step: WorkflowStep) -> bool {
+        match step {
+            WorkflowStep::Sources => true,
+            WorkflowStep::Configure => self.sources_ready(),
+            WorkflowStep::Result => self.result_ready(),
+        }
+    }
+
+    fn go_to_step(&mut self, step: WorkflowStep) {
+        if self.can_enter_step(step) {
+            self.step = step;
+        }
+    }
 }
 
 impl eframe::App for ExcelLookupApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.ui_header(ui);
-            ui.add_space(8.0);
-            self.ui_sources(ui);
-            ui.add_space(8.0);
-            self.ui_join_config(ui);
-            ui.add_space(8.0);
-            self.ui_stats(ui);
-        });
+        egui::Panel::left("workflow_sidebar")
+            .exact_size(224.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(Self::navy())
+                    .inner_margin(egui::Margin::symmetric(16, 25)),
+            )
+            .show(ui, |ui| self.ui_sidebar(ui));
+
+        egui::Panel::top("topbar")
+            .exact_size(66.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(Self::white())
+                    .stroke(Stroke::new(1.0, Self::line()))
+                    .inner_margin(egui::Margin::symmetric(35, 0)),
+            )
+            .show(ui, |ui| self.ui_topbar(ui));
+
+        egui::CentralPanel::default()
+            // 在导航栏与主工作区之间保留独立的浅色留白，避免内容贴边。
+            .frame(
+                egui::Frame::new()
+                    .fill(Self::canvas())
+                    .inner_margin(egui::Margin::symmetric(16, 0)),
+            )
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("workspace_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        self.ui_workspace(ui);
+                    });
+            });
 
         // 帧末处理延迟事件
         if let Some((side, path)) = self.pending_open.take() {
@@ -302,462 +440,1293 @@ impl eframe::App for ExcelLookupApp {
 }
 
 impl ExcelLookupApp {
-    /// 保持字号易读，同时让设置区的间距和控件高度更紧凑。
-    fn configure_ui_style(ctx: &egui::Context) {
-        ctx.all_styles_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(8.0, 5.0);
-            style.spacing.button_padding = egui::vec2(10.0, 5.0);
-            style.spacing.interact_size = egui::vec2(32.0, 32.0);
-            style.spacing.icon_width = 20.0;
-            style.spacing.icon_width_inner = 14.0;
-            style.spacing.icon_spacing = 5.0;
-            style.spacing.combo_width = 160.0;
-            style.spacing.window_margin = egui::Margin::same(10);
+    // ---------- 颜色与基础组件 ----------
 
-            style.text_styles.insert(
-                egui::TextStyle::Small,
-                egui::FontId::proportional(15.0),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Body,
-                egui::FontId::proportional(17.0),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Button,
-                egui::FontId::proportional(17.0),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Monospace,
-                egui::FontId::monospace(16.0),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Heading,
-                egui::FontId::proportional(24.0),
-            );
-        });
+    fn navy() -> Color32 {
+        Color32::from_rgb(23, 39, 59)
     }
 
-    /// 统一的功能区容器，避免设置、结果等内容挤在一条横线上。
-    fn section_frame<R>(
-        ui: &mut egui::Ui,
-        title: &str,
-        hint: &str,
-        add_contents: impl FnOnce(&mut egui::Ui) -> R,
-    ) -> egui::InnerResponse<R> {
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(10))
-            .fill(ui.visuals().faint_bg_color)
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new(title).strong().size(18.0));
-                    if !hint.is_empty() {
-                        ui.add_space(5.0);
-                        ui.weak(hint);
-                    }
-                });
-                ui.add_space(5.0);
-                add_contents(ui)
+    fn navy_2() -> Color32 {
+        Color32::from_rgb(32, 52, 77)
+    }
+
+    fn sidebar_text() -> Color32 {
+        Color32::from_rgb(231, 238, 247)
+    }
+
+    fn sidebar_muted() -> Color32 {
+        Color32::from_rgb(144, 165, 187)
+    }
+
+    fn sidebar_faint() -> Color32 {
+        Color32::from_rgb(129, 148, 170)
+    }
+
+    fn ink() -> Color32 {
+        Color32::from_rgb(31, 48, 66)
+    }
+
+    fn muted() -> Color32 {
+        Color32::from_rgb(113, 129, 150)
+    }
+
+    fn soft() -> Color32 {
+        Color32::from_rgb(149, 165, 181)
+    }
+
+    fn canvas() -> Color32 {
+        Color32::from_rgb(237, 242, 247)
+    }
+
+    fn white() -> Color32 {
+        Color32::WHITE
+    }
+
+    fn surface() -> Color32 {
+        Color32::from_rgb(251, 252, 254)
+    }
+
+    fn line() -> Color32 {
+        Color32::from_rgb(220, 229, 238)
+    }
+
+    fn line_strong() -> Color32 {
+        Color32::from_rgb(201, 214, 227)
+    }
+
+    fn blue() -> Color32 {
+        Color32::from_rgb(43, 104, 197)
+    }
+
+    fn blue_soft() -> Color32 {
+        Color32::from_rgb(234, 242, 255)
+    }
+
+    fn teal() -> Color32 {
+        Color32::from_rgb(35, 139, 120)
+    }
+
+    fn teal_soft() -> Color32 {
+        Color32::from_rgb(228, 246, 241)
+    }
+
+    fn amber() -> Color32 {
+        Color32::from_rgb(189, 116, 47)
+    }
+
+    fn card_frame(fill: Color32, stroke: Color32, margin: i8) -> egui::Frame {
+        egui::Frame::new()
+            .inner_margin(egui::Margin::same(margin))
+            .fill(fill)
+            .stroke(Stroke::new(1.0, stroke))
+            .corner_radius(CornerRadius::ZERO)
+    }
+
+    fn panel_frame() -> egui::Frame {
+        egui::Frame::new()
+            .inner_margin(egui::Margin::ZERO)
+            .fill(Self::white())
+            .stroke(Stroke::new(1.0, Self::line()))
+            .corner_radius(CornerRadius::ZERO)
+            .shadow(Shadow {
+                offset: [0, 3],
+                blur: 12,
+                spread: 0,
+                color: Color32::from_black_alpha(16),
             })
     }
 
-    fn ui_header(&mut self, ui: &mut egui::Ui) {
+    fn status_badge(ui: &mut egui::Ui, text: &str) {
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .fill(Self::teal_soft())
+            .corner_radius(CornerRadius::ZERO)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 3.0, Self::teal());
+                    ui.label(egui::RichText::new(text).size(13.0).color(Self::teal()));
+                });
+            });
+    }
+
+    fn letter_badge(ui: &mut egui::Ui, letter: &str, color: Color32) {
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(9, 6))
+            .fill(color)
+            .corner_radius(CornerRadius::ZERO)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(letter).strong().size(15.0).color(Color32::WHITE));
+            });
+    }
+
+    fn primary_button(ui: &mut egui::Ui, text: &str, width: f32, enabled: bool) -> egui::Response {
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(egui::RichText::new(text).strong().color(Color32::WHITE))
+                .min_size(egui::vec2(width, 36.0))
+                .fill(Self::blue())
+                .stroke(Stroke::NONE)
+                .corner_radius(CornerRadius::ZERO),
+        )
+    }
+
+    fn green_button(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
+        ui.add(
+            egui::Button::new(egui::RichText::new(text).strong().color(Color32::WHITE))
+                .min_size(egui::vec2(width, 36.0))
+                .fill(Self::teal())
+                .stroke(Stroke::NONE)
+                .corner_radius(CornerRadius::ZERO),
+        )
+    }
+
+    fn secondary_button(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
+        ui.add(
+            egui::Button::new(egui::RichText::new(text).color(Self::muted()))
+                .min_size(egui::vec2(width, 36.0))
+                .fill(Self::white())
+                .stroke(Stroke::new(1.0, Self::line_strong()))
+                .corner_radius(CornerRadius::ZERO),
+        )
+    }
+
+    fn action_row(ui: &mut egui::Ui, note: &str, add_buttons: impl FnOnce(&mut egui::Ui)) {
+        ui.add_space(17.0);
+        ui.separator();
+        ui.add_space(15.0);
         ui.horizontal(|ui| {
-            ui.heading("ExcelLookup");
-            ui.label(egui::RichText::new("Excel 双表连接").strong().size(18.0));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let has_res = self
-                    .result
-                    .as_ref()
-                    .map(|r| r.err.is_none() && r.table.col_count() > 0)
-                    .unwrap_or(false);
-                if ui
-                    .add_enabled(
-                        has_res,
-                        egui::Button::new("💾 导出结果…").min_size(egui::vec2(150.0, 36.0)),
-                    )
-                    .clicked()
-                {
-                    self.pending_save = true;
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                ui.painter().circle_stroke(
+                    rect.center(),
+                    5.0,
+                    Stroke::new(1.4, Self::teal()),
+                );
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(rect.center().x, rect.center().y),
+                        egui::pos2(rect.center().x + 2.5, rect.center().y + 2.0),
+                    ],
+                    Stroke::new(1.2, Self::teal()),
+                );
+                ui.label(egui::RichText::new(note).size(13.0).color(Self::muted()));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add_buttons);
+        });
+    }
+
+    fn work_panel(
+        ui: &mut egui::Ui,
+        index: &str,
+        title: &str,
+        hint: &str,
+        status: Option<&str>,
+        add_contents: impl FnOnce(&mut egui::Ui),
+    ) {
+        Self::panel_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(index)
+                        .size(13.0)
+                        .strong()
+                        .color(Self::blue()),
+                );
+                ui.label(egui::RichText::new(title).size(17.0).strong().color(Self::ink()));
+                ui.label(egui::RichText::new(hint).size(13.0).color(Self::muted()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(status) = status {
+                        Self::status_badge(ui, status);
+                    }
+                });
+            });
+            ui.separator();
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(18, 18))
+                .show(ui, add_contents);
+        });
+    }
+
+    fn sub_panel(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+        Self::card_frame(Self::surface(), Self::line(), 16).show(ui, add_contents);
+    }
+
+    // ---------- 外壳与工作流 ----------
+
+    fn ui_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(ui.available_width());
+        ui.horizontal(|ui| {
+            Self::brand_mark(ui);
+            ui.add_space(1.0);
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("ExcelLookup")
+                        .size(19.0)
+                        .strong()
+                        .color(Self::sidebar_text()),
+                );
+                ui.label(
+                    egui::RichText::new("双表连接工具")
+                        .size(13.0)
+                        .color(Self::sidebar_muted()),
+                );
+            });
+        });
+
+        ui.add_space(25.0);
+        let (rule_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 1.0),
+            egui::Sense::hover(),
+        );
+        ui.painter().hline(
+            rule_rect.x_range(),
+            rule_rect.center().y,
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(228, 239, 250, 28)),
+        );
+        ui.add_space(24.0);
+        ui.label(
+            egui::RichText::new("工作流程")
+                .size(13.0)
+                .strong()
+                .color(Self::sidebar_faint()),
+        );
+        ui.add_space(13.0);
+
+        self.ui_workflow_step(ui, WorkflowStep::Sources);
+        self.ui_workflow_step(ui, WorkflowStep::Configure);
+        self.ui_workflow_step(ui, WorkflowStep::Result);
+
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.label(
+                egui::RichText::new("ExcelLookup 0.2 · 跨平台桌面版")
+                    .size(12.0)
+                    .color(Self::sidebar_faint()),
+            );
+            ui.add_space(15.0);
+            egui::Frame::new()
+                .inner_margin(egui::Margin::same(12))
+                .fill(Color32::from_rgba_unmultiplied(11, 26, 44, 62))
+                .stroke(Stroke::new(
+                    1.0,
+                    Color32::from_rgba_unmultiplied(157, 180, 207, 38),
+                ))
+                .corner_radius(CornerRadius::ZERO)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("♢").size(17.0).color(Self::teal_soft()));
+                        ui.label(
+                            egui::RichText::new("数据仅在本机处理")
+                                .size(14.0)
+                                .strong()
+                                .color(Self::sidebar_text()),
+                        );
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("文件不会上传云端，适合处理内部与敏感数据。")
+                            .size(13.0)
+                            .color(Self::sidebar_muted()),
+                    );
+                });
+        });
+    }
+
+    fn brand_mark(ui: &mut egui::Ui) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, CornerRadius::ZERO, Self::blue());
+        let left = rect.left() + 10.0;
+        let right = rect.right() - 10.0;
+        let top = rect.top() + 10.0;
+        let bottom = rect.bottom() - 10.0;
+        let mid = rect.center().y;
+        let mark = Stroke::new(1.6, Color32::WHITE);
+        painter.line_segment(
+            [egui::pos2(left, top), egui::pos2(right, top)],
+            mark,
+        );
+        painter.line_segment(
+            [egui::pos2(left, bottom), egui::pos2(right, bottom)],
+            mark,
+        );
+        painter.line_segment(
+            [egui::pos2(left, top), egui::pos2(rect.center().x, mid)],
+            mark,
+        );
+        painter.line_segment(
+            [egui::pos2(right, top), egui::pos2(rect.center().x, mid)],
+            mark,
+        );
+        painter.line_segment(
+            [egui::pos2(rect.center().x, mid), egui::pos2(left, bottom)],
+            mark,
+        );
+        painter.line_segment(
+            [egui::pos2(rect.center().x, mid), egui::pos2(right, bottom)],
+            mark,
+        );
+    }
+
+    fn ui_workflow_step(&mut self, ui: &mut egui::Ui, step: WorkflowStep) {
+        let active = self.step == step;
+        let done = step.number() < self.step.number();
+        let enabled = self.can_enter_step(step);
+        let (title, hint) = match step {
+            WorkflowStep::Sources => {
+                if self.sources_ready() {
+                    ("数据源", "已加载 2 个文件")
+                } else {
+                    ("数据源", "加载并确认两张表")
                 }
+            }
+            WorkflowStep::Configure => {
+                if self.sources_ready() {
+                    ("连接配置", "选择匹配键与输出列")
+                } else {
+                    ("连接配置", "等待数据源")
+                }
+            }
+            WorkflowStep::Result => {
+                if self.result_ready() {
+                    ("结果预览", "检查命中情况并导出")
+                } else {
+                    ("结果预览", "执行连接后查看")
+                }
+            }
+        };
+
+        let frame = if active {
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(8, 10))
+                .fill(Self::navy_2())
+                .stroke(Stroke::new(
+                    1.0,
+                    Color32::from_rgba_unmultiplied(116, 170, 226, 82),
+                ))
+                .corner_radius(CornerRadius::ZERO)
+        } else {
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 10))
+        };
+        let inner = frame.show(ui, |ui| {
+            ui.set_min_height(39.0);
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                if done {
+                    ui.painter().circle_filled(rect.center(), 7.5, Self::teal());
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(rect.center().x - 3.0, rect.center().y),
+                            egui::pos2(rect.center().x - 0.5, rect.center().y + 2.5),
+                        ],
+                        Stroke::new(1.4, Self::navy()),
+                    );
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(rect.center().x - 0.5, rect.center().y + 2.5),
+                            egui::pos2(rect.center().x + 4.0, rect.center().y - 3.0),
+                        ],
+                        Stroke::new(1.4, Self::navy()),
+                    );
+                } else if active {
+                    ui.painter().circle_filled(rect.center(), 7.5, Self::navy());
+                    ui.painter().circle_stroke(
+                        rect.center(),
+                        7.5,
+                        Stroke::new(3.5, Color32::from_rgb(121, 169, 229)),
+                    );
+                } else {
+                    ui.painter().circle_stroke(
+                        rect.center(),
+                        7.5,
+                        Stroke::new(1.0, Color32::from_rgb(109, 145, 179)),
+                    );
+                }
+                ui.vertical(|ui| {
+                    let title_color = if enabled {
+                        Self::sidebar_text()
+                    } else {
+                        Self::sidebar_faint()
+                    };
+                    let hint_color = if active {
+                        Color32::from_rgb(184, 204, 227)
+                    } else {
+                        Self::sidebar_muted()
+                    };
+                    ui.label(egui::RichText::new(title).size(15.0).strong().color(title_color));
+                    ui.add_space(3.0);
+                    ui.label(egui::RichText::new(hint).size(13.0).color(hint_color));
+                });
+            });
+        });
+        let response = ui.interact(
+            inner.response.rect,
+            ui.id().with(("workflow-step", step.number())),
+            egui::Sense::click(),
+        );
+        if enabled && response.clicked() {
+            self.go_to_step(step);
+        }
+    }
+
+    fn ui_topbar(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("连接工作台").strong().color(Self::ink()));
+            ui.label(egui::RichText::new("/").color(Self::soft()));
+            ui.label(egui::RichText::new("新建连接").color(Self::muted()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.5, Self::teal());
+                ui.label(egui::RichText::new("本地运行中").size(14.0).color(Self::teal()));
+                ui.add_space(17.0);
+                let response = ui.add(
+                    egui::Button::new(egui::RichText::new("?").size(14.0).color(Self::muted()))
+                        .min_size(egui::vec2(26.0, 26.0))
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::NONE)
+                        .corner_radius(CornerRadius::ZERO),
+                );
+                response.on_hover_text("查看使用说明");
             });
         });
     }
 
-    fn ui_sources(&mut self, ui: &mut egui::Ui) {
-        Self::section_frame(ui, "① 数据源", "分别加载主表和匹配表，可切换工作表", |ui| {
-            ui.columns(2, |cols| {
-                self.ui_source_card(&mut cols[0], Side::Left);
-                self.ui_source_card(&mut cols[1], Side::Right);
+    fn ui_workspace(&mut self, ui: &mut egui::Ui) {
+        self.ui_page_heading(ui);
+        ui.add_space(18.0);
+
+        if self.step != WorkflowStep::Sources && self.sources_ready() {
+            self.ui_context_strip(ui);
+            ui.add_space(13.0);
+        }
+
+        match self.step {
+            WorkflowStep::Sources => self.ui_step_sources(ui),
+            WorkflowStep::Configure => self.ui_step_config(ui),
+            WorkflowStep::Result => self.ui_step_result(ui),
+        }
+    }
+
+    fn ui_page_heading(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(self.step.eyebrow())
+                        .size(13.0)
+                        .strong()
+                        .color(Self::blue()),
+                );
+                ui.add_space(5.0);
+                ui.label(
+                    egui::RichText::new(self.step.title())
+                        .size(30.0)
+                        .strong()
+                        .color(Self::ink()),
+                );
+                ui.add_space(5.0);
+                ui.label(
+                    egui::RichText::new(self.step.description())
+                        .size(15.0)
+                        .color(Self::muted()),
+                );
             });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
+                ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("♢").size(18.0).color(Self::blue()));
+                    ui.label(
+                        egui::RichText::new("适用于 VLOOKUP 与多表合并")
+                            .size(13.0)
+                            .color(Self::muted()),
+                    );
+                });
+            });
+        });
+    }
+
+    fn ui_context_strip(&mut self, ui: &mut egui::Ui) {
+        let left = self.source_context_data(Side::Left);
+        let right = self.source_context_data(Side::Right);
+        Self::card_frame(Self::white(), Self::line(), 13).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                Self::context_source(ui, Side::Left, &left.0, &left.1, left.2, left.3);
+                ui.separator();
+                Self::context_source(ui, Side::Right, &right.0, &right.1, right.2, right.3);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if Self::secondary_button(ui, "更换数据源  ↻", 112.0).clicked() {
+                        self.go_to_step(WorkflowStep::Sources);
+                    }
+                });
+            });
+        });
+    }
+
+    fn source_context_data(&self, side: Side) -> (String, String, usize, usize) {
+        let src = match side {
+            Side::Left => &self.left,
+            Side::Right => &self.right,
+        };
+        (
+            format!("{} · {}", src.label(), src.cur_sheet_name()),
+            format!("{} 行 · {} 列", src.cur_row_count(), src.cur_col_count()),
+            src.cur_row_count(),
+            src.cur_col_count(),
+        )
+    }
+
+    fn context_source(
+        ui: &mut egui::Ui,
+        side: Side,
+        label: &str,
+        info: &str,
+        _rows: usize,
+        _cols: usize,
+    ) {
+        ui.horizontal(|ui| {
+            Self::letter_badge(
+                ui,
+                match side {
+                    Side::Left => "A",
+                    Side::Right => "B",
+                },
+                match side {
+                    Side::Left => Self::blue(),
+                    Side::Right => Self::teal(),
+                },
+            );
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new(label).size(13.0).strong().color(Self::ink()));
+                ui.label(egui::RichText::new(info).size(12.0).color(Self::muted()));
+            });
+        });
+    }
+
+    // ---------- 第一步:数据源 ----------
+
+    fn ui_step_sources(&mut self, ui: &mut egui::Ui) {
+        let status = if self.sources_ready() {
+            Some("已加载 2 个文件")
+        } else {
+            None
+        };
+        Self::work_panel(
+            ui,
+            "01",
+            "加载数据源",
+            "先确认需要连接的两张表",
+            status,
+            |ui| self.ui_sources_body(ui),
+        );
+    }
+
+    fn ui_sources_body(&mut self, ui: &mut egui::Ui) {
+        ui.columns(2, |cols| {
+            self.ui_source_card(&mut cols[0], Side::Left);
+            self.ui_source_card(&mut cols[1], Side::Right);
+        });
+
+        let can_next = self.sources_ready();
+        Self::action_row(ui, "文件只在本机读取，不会上传", |ui| {
+            if Self::primary_button(ui, "下一步：配置连接  →", 152.0, can_next).clicked() {
+                self.go_to_step(WorkflowStep::Configure);
+            }
+            if Self::secondary_button(ui, "清空数据源", 104.0).clicked() {
+                self.clear_sources();
+            }
         });
     }
 
     fn ui_source_card(&mut self, ui: &mut egui::Ui, side: Side) {
-        let title = match side {
-            Side::Left => "数据源 A(主表)",
-            Side::Right => "数据源 B(匹配表)",
+        let (loaded, label, rows, cols, sheet_names, sheet_idx, error) = {
+            let src = match side {
+                Side::Left => &self.left,
+                Side::Right => &self.right,
+            };
+            (
+                src.is_loaded(),
+                src.label(),
+                src.cur_row_count(),
+                src.cur_col_count(),
+                src.sheet_names.clone(),
+                src.sheet_idx,
+                src.error.clone(),
+            )
         };
-        // 先拷贝需要的数据,避免闭包内同时可变借用 self
-        let (label, info, error): (String, Option<String>, Option<String>) = match side {
-            Side::Left => (
-                self.left_label(),
-                self.left_info(),
-                self.left.error.clone(),
-            ),
-            Side::Right => (
-                self.right_label(),
-                self.right_info(),
-                self.right.error.clone(),
-            ),
+        let accent = match side {
+            Side::Left => Self::blue(),
+            Side::Right => Self::teal(),
         };
-        let (sheet_names, cur_idx, has_multi): (Vec<String>, usize, bool) = match side {
-            Side::Left => (
-                self.left.sheet_names.clone(),
-                self.left.sheet_idx,
-                self.left.sheets.len() > 1,
-            ),
-            Side::Right => (
-                self.right.sheet_names.clone(),
-                self.right.sheet_idx,
-                self.right.sheets.len() > 1,
-            ),
+        let role = match side {
+            Side::Left => ("主表", "需要保留的完整数据"),
+            Side::Right => ("匹配表", "提供需要带出的字段"),
         };
 
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(8))
-            .fill(ui.visuals().window_fill())
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new(title).strong().size(17.0));
-                    if info.is_some() && error.is_none() {
-                        ui.weak("已就绪");
+        Self::card_frame(Self::surface(), Self::line(), 16).show(ui, |ui| {
+            ui.set_min_height(238.0);
+            ui.horizontal(|ui| {
+                Self::letter_badge(
+                    ui,
+                    match side {
+                        Side::Left => "A",
+                        Side::Right => "B",
+                    },
+                    accent,
+                );
+                ui.add_space(1.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(role.0).size(16.0).strong().color(Self::ink()));
+                        ui.label(egui::RichText::new(role.1).size(13.0).color(Self::muted()));
+                    });
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if loaded && error.is_none() {
+                        Self::status_badge(ui, "已加载");
                     }
+                });
+            });
+            ui.add_space(19.0);
 
-                    ui.separator();
-                    let file_button_width = ui.available_width().clamp(160.0, 520.0);
-                    if ui
-                        .add_sized([file_button_width, 32.0], egui::Button::new(label))
-                        .clicked()
-                    {
-                        self.pick_and_load(side);
-                    }
+            let file_label = if loaded {
+                format!("▣  {label}")
+            } else {
+                "选择工作簿".to_owned()
+            };
+            let button_width = ui.available_width();
+            if ui
+                .add_sized(
+                    [button_width, 39.0],
+                    egui::Button::new(egui::RichText::new(file_label).strong().color(Self::ink()))
+                        .fill(Self::white())
+                        .stroke(Stroke::new(1.0, Self::line_strong()))
+                .corner_radius(CornerRadius::ZERO),
+                )
+                .clicked()
+            {
+                self.pick_and_load(side);
+            }
 
-                    // sheet 下拉(多 sheet 时显示)
-                    if has_multi && !sheet_names.is_empty() {
-                        ui.separator();
-                        ui.label("工作表");
-                        let cur = sheet_names.get(cur_idx).cloned().unwrap_or_default();
-                        egui::ComboBox::from_id_salt(match side {
-                            Side::Left => "l_sheet",
-                            Side::Right => "r_sheet",
-                        })
-                        .selected_text(cur)
-                        .width(180.0)
-                        .show_ui(ui, |ui| {
-                            for (i, n) in sheet_names.iter().enumerate() {
-                                if ui.selectable_label(i == cur_idx, n).clicked() {
-                                    self.switch_sheet(side, i);
-                                }
+            if loaded {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!("工作簿 · {rows} 行 · {cols} 列"))
+                        .size(13.0)
+                        .color(Self::muted()),
+                );
+                ui.add_space(17.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("工作表").size(13.0).color(Self::soft()));
+                    ui.add_space(8.0);
+                    let current = sheet_names
+                        .get(sheet_idx)
+                        .cloned()
+                        .unwrap_or_else(|| "未选择".into());
+                    egui::ComboBox::from_id_salt(match side {
+                        Side::Left => "workflow_left_sheet",
+                        Side::Right => "workflow_right_sheet",
+                    })
+                    .selected_text(current)
+                    .width((ui.available_width() - 76.0).max(110.0))
+                    .show_ui(ui, |ui| {
+                        for (index, name) in sheet_names.iter().enumerate() {
+                            if ui.selectable_label(index == sheet_idx, name).clicked() {
+                                self.switch_sheet(side, index);
                             }
-                        });
+                        }
+                    });
+                    if sheet_names.len() > 1 {
+                        ui.label(
+                            egui::RichText::new(format!("共 {} 个", sheet_names.len()))
+                                .size(12.0)
+                                .color(Self::muted()),
+                        );
                     }
                 });
+                ui.add_space(13.0);
+                ui.label(
+                    egui::RichText::new(match side {
+                        Side::Left => "✓ 将保留主表全部行",
+                        Side::Right => "✓ 可从匹配表带出客户信息",
+                    })
+                    .size(12.0)
+                    .color(Self::teal()),
+                );
+            } else {
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("选择一个工作簿后，可在这里切换工作表")
+                        .size(13.0)
+                        .color(Self::muted()),
+                );
+            }
 
-                ui.add_space(3.0);
-                if let Some(info) = &info {
-                    ui.label(info);
-                }
-                if let Some(e) = &error {
-                    ui.colored_label(Color32::LIGHT_RED, e);
-                }
-            });
-    }
-
-    fn left_label(&self) -> String {
-        if self.left.is_loaded() {
-            format!("📄 {}", self.left.label())
-        } else {
-            "选择 Excel 文件…".into()
-        }
-    }
-    fn right_label(&self) -> String {
-        if self.right.is_loaded() {
-            format!("📄 {}", self.right.label())
-        } else {
-            "选择 Excel 文件…".into()
-        }
-    }
-    fn left_info(&self) -> Option<String> {
-        if !self.left.is_loaded() {
-            return None;
-        }
-        Some(format!(
-            "工作表 [{}]: {} 行 × {} 列 (共 {} 个工作表)",
-            self.left.cur_sheet_name(),
-            self.left.cur_row_count(),
-            self.left.cur_col_count(),
-            self.left.sheets.len()
-        ))
-    }
-    fn right_info(&self) -> Option<String> {
-        if !self.right.is_loaded() {
-            return None;
-        }
-        Some(format!(
-            "工作表 [{}]: {} 行 × {} 列 (共 {} 个工作表)",
-            self.right.cur_sheet_name(),
-            self.right.cur_row_count(),
-            self.right.cur_col_count(),
-            self.right.sheets.len()
-        ))
-    }
-
-    fn ui_join_config(&mut self, ui: &mut egui::Ui) {
-        Self::section_frame(ui, "② 连接设置", "定义连接方式、匹配键和结果列", |ui| {
-            ui.columns(3, |cols| {
-                cols[0].vertical(|ui| {
-                    ui.label(egui::RichText::new("连接类型").strong());
-                    ui.add_space(5.0);
-                    egui::ComboBox::from_id_salt("join_type")
-                        .selected_text(self.join_type.label())
-                        .width(ui.available_width())
-                        .show_ui(ui, |ui| {
-                            for jt in JoinType::all() {
-                                ui.selectable_value(&mut self.join_type, jt, jt.label());
-                            }
-                        });
-                });
-
-                cols[1].vertical(|ui| {
-                    ui.label(egui::RichText::new("A 键列（匹配列）").strong());
-                    ui.add_space(5.0);
-                    let headers = self.left.cur_headers();
-                    Self::col_combo(ui, "a_key", &headers, &mut self.left_key_col);
-                });
-
-                cols[2].vertical(|ui| {
-                    ui.label(egui::RichText::new("B 键列（匹配列）").strong());
-                    ui.add_space(5.0);
-                    let headers = self.right.cur_headers();
-                    Self::col_combo(ui, "b_key", &headers, &mut self.right_key_col);
-                });
-            });
-
-            ui.add_space(6.0);
-            ui.columns(2, |cols| {
-                cols[0].vertical(|ui| {
-                    egui::Frame::group(ui.style())
-                        .inner_margin(egui::Margin::same(7))
-                        .fill(ui.visuals().window_fill())
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new("匹配规则").strong().size(16.0));
-                            ui.add_space(2.0);
-                            ui.horizontal_wrapped(|ui| {
-                                ui.checkbox(
-                                    &mut self.normalize_keys,
-                                    "键宽松匹配（数字/文本互认，忽略首尾空格）",
-                                );
-                                ui.checkbox(
-                                    &mut self.bracket_fold,
-                                    "括号归一化（中文（）与英文()互认）",
-                                );
-                            });
-                        });
-                });
-
-                cols[1].vertical(|ui| {
-                    egui::Frame::group(ui.style())
-                        .inner_margin(egui::Margin::same(7))
-                        .fill(ui.visuals().window_fill())
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new("输出列").strong().size(16.0));
-                            ui.add_space(2.0);
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("B 取值列");
-                                let rc = self.right.cur_col_count();
-                                if rc == 0 {
-                                    ui.weak("加载 B 后可勾选");
-                                } else {
-                                    let headers = self.right.cur_headers();
-                                    for i in 0..rc {
-                                        if i == self.right_key_col {
-                                            continue;
-                                        }
-                                        let mut checked = self.right_pick_cols.contains(&i);
-                                        if ui.checkbox(&mut checked, &headers[i]).changed() {
-                                            if checked {
-                                                if !self.right_pick_cols.contains(&i) {
-                                                    self.right_pick_cols.push(i);
-                                                }
-                                            } else {
-                                                self.right_pick_cols.retain(|&c| c != i);
-                                            }
-                                        }
-                                    }
-                                    if self.right_pick_cols.is_empty() {
-                                        ui.weak("未选取值列，结果将只有 A 的列");
-                                    }
-                                }
-                            });
-                        });
-                });
-            });
-
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_sized(
-                        [140.0, 36.0],
-                        egui::Button::new(egui::RichText::new("▶  执行连接").strong()),
-                    )
-                    .clicked()
-                {
-                    self.run_join();
-                }
-                if ui
-                    .add_sized([120.0, 36.0], egui::Button::new("↺  清空结果"))
-                    .clicked()
-                {
-                    self.result = None;
-                }
-                ui.weak("设置完成后执行连接");
-            });
+            if let Some(error) = &error {
+                ui.add_space(8.0);
+                ui.colored_label(Self::amber(), format!("⚠ {error}"));
+            }
         });
     }
 
-    /// 列选择下拉(带未加载禁用)
-    fn col_combo(
-        ui: &mut egui::Ui,
-        id: &str,
-        headers: &[String],
-        sel: &mut usize,
-    ) {
+    // ---------- 第二步:连接配置 ----------
+
+    fn ui_step_config(&mut self, ui: &mut egui::Ui) {
+        let status = if self.sources_ready() {
+            Some("配置完整")
+        } else {
+            None
+        };
+        Self::work_panel(
+            ui,
+            "02",
+            "连接配置",
+            "告诉 ExcelLookup 如何对齐两张表",
+            status,
+            |ui| self.ui_config_body(ui),
+        );
+    }
+
+    fn ui_config_body(&mut self, ui: &mut egui::Ui) {
+        if !self.sources_ready() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
+                ui.label(egui::RichText::new("请先加载 A、B 两个数据源").size(16.0).strong());
+                ui.add_space(12.0);
+                if Self::primary_button(ui, "返回数据源", 120.0, true).clicked() {
+                    self.go_to_step(WorkflowStep::Sources);
+                }
+            });
+            return;
+        }
+
+        let left_headers = self.left.cur_headers();
+        let right_headers = self.right.cur_headers();
+        Self::sub_panel(ui, |ui| {
+            if ui.available_width() >= 700.0 {
+                ui.columns(3, |cols| {
+                    cols[0].vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("A 匹配列")
+                                .size(13.0)
+                                .strong()
+                                .color(Self::muted()),
+                        );
+                        ui.add_space(7.0);
+                        Self::col_combo(ui, "workflow_a_key", &left_headers, &mut self.left_key_col);
+                    });
+                    cols[1].vertical_centered(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("→").size(24.0).color(Self::blue()));
+                        egui::ComboBox::from_id_salt("workflow_join_type")
+                            .selected_text(Self::join_type_short(self.join_type))
+                            .width(112.0)
+                            .show_ui(ui, |ui| {
+                                for join_type in JoinType::all() {
+                                    ui.selectable_value(
+                                        &mut self.join_type,
+                                        join_type,
+                                        join_type.label(),
+                                    );
+                                }
+                            });
+                        ui.label(
+                            egui::RichText::new("保留 A 的全部行")
+                                .size(12.0)
+                                .color(Self::soft()),
+                        );
+                    });
+                    cols[2].vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("B 匹配列")
+                                .size(13.0)
+                                .strong()
+                                .color(Self::muted()),
+                        );
+                        ui.add_space(7.0);
+                        Self::col_combo(ui, "workflow_b_key", &right_headers, &mut self.right_key_col);
+                    });
+                });
+            } else {
+                ui.label(egui::RichText::new("A 匹配列").strong().color(Self::muted()));
+                Self::col_combo(ui, "workflow_a_key_small", &left_headers, &mut self.left_key_col);
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("连接类型").strong().color(Self::muted()));
+                egui::ComboBox::from_id_salt("workflow_join_type_small")
+                    .selected_text(self.join_type.label())
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for join_type in JoinType::all() {
+                            ui.selectable_value(&mut self.join_type, join_type, join_type.label());
+                        }
+                    });
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("B 匹配列").strong().color(Self::muted()));
+                Self::col_combo(ui, "workflow_b_key_small", &right_headers, &mut self.right_key_col);
+            }
+        });
+
+        ui.add_space(13.0);
+        Self::sub_panel(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("B 输出列").size(13.0).strong().color(Self::muted()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new("选择需要带入结果的字段")
+                            .size(12.0)
+                            .color(Self::soft()),
+                    );
+                });
+            });
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                for (index, header) in right_headers.iter().enumerate() {
+                    if index == self.right_key_col {
+                        continue;
+                    }
+                    let selected = self.right_pick_cols.contains(&index);
+                    if Self::toggle_chip(ui, header, selected).clicked() {
+                        if selected {
+                            self.right_pick_cols.retain(|&column| column != index);
+                        } else {
+                            self.right_pick_cols.push(index);
+                        }
+                    }
+                }
+                if self.right_pick_cols.is_empty() {
+                    ui.label(
+                        egui::RichText::new("未选择字段，结果将只有 A 的列")
+                            .size(12.0)
+                            .color(Self::soft()),
+                    );
+                }
+            });
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                Self::toggle_switch(ui, &mut self.normalize_keys, "键宽松匹配");
+                ui.label(
+                    egui::RichText::new("数字/文本互认，忽略首尾空格")
+                        .size(12.0)
+                        .color(Self::soft()),
+                );
+                ui.add_space(15.0);
+                Self::toggle_switch(ui, &mut self.bracket_fold, "括号归一化");
+                ui.label(
+                    egui::RichText::new("中文（）与英文()互认")
+                        .size(12.0)
+                        .color(Self::soft()),
+                );
+            });
+        });
+
+        Self::action_row(ui, "配置会保留，可随时返回调整", |ui| {
+            if Self::primary_button(ui, "执行连接并查看结果  →", 180.0, true).clicked() {
+                self.run_join();
+            }
+            if Self::secondary_button(ui, "上一步", 72.0).clicked() {
+                self.go_to_step(WorkflowStep::Sources);
+            }
+            if self.result.is_some()
+                && Self::secondary_button(ui, "清空结果", 80.0).clicked()
+            {
+                self.clear_result();
+            }
+        });
+    }
+
+    fn join_type_short(join_type: JoinType) -> &'static str {
+        match join_type {
+            JoinType::Left => "左连接",
+            JoinType::Inner => "内连接",
+            JoinType::Right => "右连接",
+            JoinType::Full => "全连接",
+        }
+    }
+
+    fn col_combo(ui: &mut egui::Ui, id: &str, headers: &[String], sel: &mut usize) {
         if headers.is_empty() {
             ui.add_enabled(false, egui::Button::new("—"));
             return;
         }
-        let sel_text = headers.get(*sel).cloned().unwrap_or_default();
+        let selected = headers.get(*sel).cloned().unwrap_or_default();
         egui::ComboBox::from_id_salt(id)
-            .selected_text(sel_text)
+            .selected_text(selected)
             .width(ui.available_width())
             .show_ui(ui, |ui| {
-                for (i, n) in headers.iter().enumerate() {
-                    ui.selectable_value(sel, i, n);
+                for (index, name) in headers.iter().enumerate() {
+                    ui.selectable_value(sel, index, name);
                 }
             });
     }
 
-    fn ui_stats(&self, ui: &mut egui::Ui) {
-        Self::section_frame(ui, "③ 连接结果", "查看命中统计、结果预览并导出文件", |ui| {
-            let Some(res) = &self.result else {
-                ui.weak("加载 A/B 两个数据源，选好键列后点击「执行连接」。");
-                return;
-            };
-            if let Some(e) = &res.err {
-                ui.colored_label(Color32::LIGHT_RED, format!("⚠ {e}"));
-                return;
-            }
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(res.join_type.label()).strong());
-                ui.separator();
-                ui.label(format!(
-                    "A：{} 行，匹配 {} 行",
-                    res.left_total, res.left_matched
-                ));
-                ui.separator();
-                ui.label(format!(
-                    "B：{} 行，命中 {} 行",
-                    res.right_total, res.right_matched_rows
-                ));
-                ui.separator();
-                ui.label(format!("结果：{} 行", res.out_rows));
-            });
+    fn toggle_chip(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+        let fill = if selected {
+            Self::blue_soft()
+        } else {
+            Self::white()
+        };
+        let stroke = if selected {
+            Color32::from_rgb(197, 216, 243)
+        } else {
+            Self::line_strong()
+        };
+        let text = if selected {
+            egui::RichText::new(format!("• {label}")).size(13.0).color(Self::blue())
+        } else {
+            egui::RichText::new(format!("＋ {label}")).size(13.0).color(Self::muted())
+        };
+        ui.add(
+            egui::Button::new(text)
+                .min_size(egui::vec2(0.0, 29.0))
+                .fill(fill)
+                .stroke(Stroke::new(1.0, stroke))
+                .corner_radius(CornerRadius::ZERO),
+        )
+    }
 
-            ui.add_space(10.0);
+    fn toggle_switch(ui: &mut egui::Ui, value: &mut bool, label: &str) {
+        ui.horizontal(|ui| {
+            let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 18.0), egui::Sense::click());
+            if response.clicked() {
+                *value = !*value;
+            }
+            let fill = if *value { Self::teal() } else { Self::line_strong() };
+            ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
+            let knob = if *value {
+                egui::pos2(rect.right() - 8.0, rect.center().y)
+            } else {
+                egui::pos2(rect.left() + 8.0, rect.center().y)
+            };
+            ui.painter().circle_filled(knob, 6.0, Color32::WHITE);
+            ui.label(egui::RichText::new(label).size(13.0).color(Self::muted()));
+        });
+    }
+
+    // ---------- 第三步:结果预览 ----------
+
+    fn ui_step_result(&mut self, ui: &mut egui::Ui) {
+        let status = if self.result_ready() {
+            Some("连接完成")
+        } else {
+            None
+        };
+        Self::work_panel(
+            ui,
+            "03",
+            "连接结果",
+            "预览确认后再导出",
+            status,
+            |ui| self.ui_result_body(ui),
+        );
+    }
+
+    fn ui_result_body(&mut self, ui: &mut egui::Ui) {
+        let Some(result) = &self.result else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(24.0);
+                ui.label(egui::RichText::new("执行连接后，结果会显示在这里").size(16.0).color(Self::muted()));
+                ui.add_space(12.0);
+                if Self::primary_button(ui, "返回连接配置", 130.0, true).clicked() {
+                    self.go_to_step(WorkflowStep::Configure);
+                }
+            });
+            return;
+        };
+        if let Some(error) = &result.err {
+            ui.colored_label(Self::amber(), format!("⚠ {error}"));
+            Self::action_row(ui, "请返回连接配置检查数据", |ui| {
+                if Self::secondary_button(ui, "返回配置", 90.0).clicked() {
+                    self.go_to_step(WorkflowStep::Configure);
+                }
+            });
+            return;
+        }
+
+        let left_total = result.left_total;
+        let left_matched = result.left_matched;
+        let left_unmatched = left_total.saturating_sub(left_matched);
+        let right_total = result.right_total;
+        let right_matched = result.right_matched_rows;
+        let out_rows = result.out_rows;
+        let join_label = result.join_type.label();
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(join_label).size(13.0).strong().color(Self::blue()));
             ui.separator();
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("结果预览").strong().size(17.0));
-            ui.add_space(6.0);
-            self.ui_result_table(ui);
+            ui.label(
+                egui::RichText::new(format!(
+                    "A：{left_total} 行 · B：{right_total} 行 · B 命中 {right_matched} 行"
+                ))
+                .size(12.0)
+                .color(Self::muted()),
+            );
+        });
+        ui.add_space(13.0);
+
+        ui.columns(4, |cols| {
+            Self::metric_card(&mut cols[0], "A 主表行数", &left_total.to_string(), "全部保留", Self::blue());
+            Self::metric_card(
+                &mut cols[1],
+                "已匹配",
+                &left_matched.to_string(),
+                &format!(
+                    "匹配率 {:.1}%",
+                    if left_total == 0 {
+                        0.0
+                    } else {
+                        left_matched as f64 / left_total as f64 * 100.0
+                    }
+                ),
+                Self::teal(),
+            );
+            Self::metric_card(
+                &mut cols[2],
+                "未命中",
+                &left_unmatched.to_string(),
+                "建议检查匹配列",
+                Self::amber(),
+            );
+            Self::metric_card(
+                &mut cols[3],
+                "结果行数",
+                &out_rows.to_string(),
+                "含重复键展开",
+                Self::muted(),
+            );
+        });
+
+        ui.add_space(17.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("结果预览").size(15.0).strong().color(Self::ink()));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} 行 × {} 列",
+                    result.table.row_count(),
+                    result.table.col_count()
+                ))
+                .size(12.0)
+                .color(Self::muted()),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let edit = egui::TextEdit::singleline(&mut self.result_filter)
+                    .hint_text("筛选结果")
+                    .desired_width(180.0)
+                    .font(egui::TextStyle::Small);
+                ui.add(edit);
+            });
+        });
+        ui.add_space(8.0);
+        self.ui_result_table(ui);
+
+        Self::action_row(ui, "确认无误后导出为新的工作簿", |ui| {
+            if Self::green_button(ui, "导出结果  ↓", 112.0).clicked() {
+                self.pending_save = true;
+            }
+            if Self::secondary_button(ui, "返回配置", 88.0).clicked() {
+                self.go_to_step(WorkflowStep::Configure);
+            }
+        });
+    }
+
+    fn metric_card(ui: &mut egui::Ui, label: &str, value: &str, note: &str, accent: Color32) {
+        Self::card_frame(Self::surface(), Self::line(), 9).show(ui, |ui| {
+            ui.set_min_height(70.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(label).size(12.0).color(Self::muted()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::same(4))
+                        .fill(accent.gamma_multiply(0.10))
+                        .corner_radius(CornerRadius::ZERO)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("▦").size(13.0).color(accent));
+                        });
+                });
+            });
+            ui.add_space(7.0);
+            ui.label(egui::RichText::new(value).size(24.0).strong().color(Self::ink()));
+            ui.label(egui::RichText::new(note).size(11.0).color(accent));
         });
     }
 
     fn ui_result_table(&self, ui: &mut egui::Ui) {
-        let Some(res) = &self.result else { return };
-        if res.err.is_some() || res.table.col_count() == 0 {
+        let Some(result) = &self.result else { return };
+        if result.err.is_some() || result.table.col_count() == 0 {
             return;
         }
-        let table = &res.table;
+
+        let table = &result.table;
         let headers = table.headers.clone();
         let ncols = table.col_count();
-        let row_count = table.row_count();
+        let filter = self.result_filter.trim().to_lowercase();
+        let visible_rows: Option<Vec<usize>> = if filter.is_empty() {
+            None
+        } else {
+            Some(
+                table
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, row)| {
+                        let found = row
+                            .iter()
+                            .any(|cell| cell.display().to_lowercase().contains(&filter));
+                        found.then_some(index)
+                    })
+                    .collect(),
+            )
+        };
+        let row_count = visible_rows
+            .as_ref()
+            .map(|rows| rows.len())
+            .unwrap_or(table.row_count());
 
-        // 紧凑行高:正文行高 + 少量内边距,避免每行过高
+        if row_count == 0 {
+            ui.label(egui::RichText::new("没有符合条件的行").size(13.0).color(Self::muted()));
+            return;
+        }
+
         let text_h = ui.text_style_height(&egui::TextStyle::Body);
-        let row_h = (text_h + 6.0).max(20.0);
-
-        // 网格线颜色:用控件边框色(自动适配明/暗主题)
-        let sep_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
-        let sep_width = 1.0;
-
-        // 表格自身带滚动,不再包外层 ScrollArea;
-        // 列宽:除最后一列外按内容自适应,最后一列占满剩余宽度(解决表格不铺满窗格)
+        let row_h = (text_h + 7.0).max(22.0);
+        let sep_color = Self::line();
         let mut builder = TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .vscroll(true)
-            .max_scroll_height(f32::INFINITY);
+            .max_scroll_height(300.0);
         if ncols >= 2 {
             builder = builder
-                .columns(Column::auto().at_least(60.0).clip(true), ncols - 1)
+                .columns(Column::auto().at_least(70.0).clip(true), ncols - 1)
                 .column(Column::remainder().at_least(80.0).clip(true));
         } else {
-            builder = builder.columns(Column::auto().at_least(60.0).clip(true), ncols);
+            builder = builder.columns(Column::remainder().at_least(80.0).clip(true), ncols);
         }
 
-        // 表头:底边加粗分隔线
         builder
             .header(row_h, |mut header| {
-                for h in &headers {
+                for name in &headers {
                     header.col(|ui| {
-                        ui.strong(h);
+                        ui.label(egui::RichText::new(name).size(13.0).strong().color(Self::muted()));
                     });
                 }
             })
             .body(|body| {
                 body.rows(row_h, row_count, |mut row| {
-                    let ridx = row.index();
-                    for c in 0..ncols {
+                    let index = visible_rows
+                        .as_ref()
+                        .map(|rows| rows[row.index()])
+                        .unwrap_or(row.index());
+                    for column in 0..ncols {
                         row.col(|ui| {
-                            let v = table
-                                .cell(ridx, c)
-                                .map(CellValue::display)
-                                .unwrap_or_default();
-                            ui.label(v);
-
-                            // 在单元格自身 ui 上画网格线(借用安全):
-                            // 底横线 + (非末列)右侧竖线
+                            let value = table
+                                .cell(index, column)
+                                .cloned()
+                                .unwrap_or(CellValue::Empty);
+                            if value == CellValue::Empty {
+                                ui.label(egui::RichText::new("—").size(13.0).color(Self::soft()));
+                            } else {
+                                ui.label(egui::RichText::new(value.display()).size(13.0).color(Self::ink()));
+                            }
                             let rect = ui.max_rect();
                             let painter = ui.painter();
                             painter.hline(
                                 rect.x_range(),
                                 rect.bottom(),
-                                egui::Stroke::new(sep_width, sep_color),
+                                Stroke::new(1.0, sep_color),
                             );
-                            if c < ncols - 1 {
+                            if column < ncols - 1 {
                                 painter.vline(
                                     rect.right(),
                                     rect.y_range(),
-                                    egui::Stroke::new(sep_width, sep_color),
+                                    Stroke::new(1.0, sep_color),
                                 );
                             }
                         });
                     }
                 });
             });
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("显示前 {} 行 · 可滚动查看完整结果", row_count.min(100)))
+                    .size(12.0)
+                    .color(Self::soft()),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new("大数据表已启用虚拟滚动")
+                        .size(12.0)
+                        .color(Self::soft()),
+                );
+            });
+        });
+    }
+
+    /// 配置 egui 视觉样式:浅色工作区 + 深色流程侧栏。
+    fn configure_ui_style(ctx: &egui::Context) {
+        let mut visuals = egui::Visuals::light();
+        visuals.panel_fill = Self::canvas();
+        visuals.window_fill = Self::white();
+        visuals.faint_bg_color = Self::surface();
+        visuals.extreme_bg_color = Self::white();
+        visuals.text_edit_bg_color = Some(Self::white());
+        visuals.hyperlink_color = Self::blue();
+        visuals.warn_fg_color = Self::amber();
+        visuals.error_fg_color = Color32::from_rgb(177, 74, 61);
+        visuals.window_corner_radius = CornerRadius::ZERO;
+        visuals.menu_corner_radius = CornerRadius::ZERO;
+        visuals.window_shadow = Shadow {
+            offset: [0, 3],
+            blur: 12,
+            spread: 0,
+            color: Color32::from_black_alpha(18),
+        };
+        visuals.window_stroke = Stroke::new(1.0, Self::line());
+        visuals.widgets.noninteractive.bg_fill = Self::white();
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Self::line());
+        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Self::ink());
+        visuals.widgets.inactive.bg_fill = Self::white();
+        visuals.widgets.inactive.weak_bg_fill = Self::white();
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Self::line_strong());
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, Self::ink());
+        visuals.widgets.hovered.bg_fill = Self::blue_soft();
+        visuals.widgets.hovered.weak_bg_fill = Self::blue_soft();
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Self::blue());
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Self::blue());
+        visuals.widgets.active.bg_fill = Self::blue_soft();
+        visuals.widgets.active.weak_bg_fill = Self::blue_soft();
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0, Self::blue());
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0, Self::blue());
+        visuals.widgets.noninteractive.corner_radius = CornerRadius::ZERO;
+        visuals.widgets.inactive.corner_radius = CornerRadius::ZERO;
+        visuals.widgets.hovered.corner_radius = CornerRadius::ZERO;
+        visuals.widgets.active.corner_radius = CornerRadius::ZERO;
+        visuals.widgets.open.corner_radius = CornerRadius::ZERO;
+        visuals.selection.bg_fill = Self::blue_soft();
+        visuals.selection.stroke = Stroke::new(1.0, Self::blue());
+        // Windows 的桌面文字通常更接近像素对齐效果，关闭 egui 的子像素分箱可减少
+        // 小字号 Latin 字符的发虚；CJK 字符本身不会启用该模式。
+        if cfg!(windows) {
+            visuals.text_options.subpixel_binning = false;
+        }
+        ctx.set_visuals(visuals);
+
+        ctx.all_styles_mut(|style| {
+            style.spacing.item_spacing = egui::vec2(8.0, 5.0);
+            style.spacing.button_padding = egui::vec2(10.0, 5.0);
+            style.spacing.interact_size = egui::vec2(32.0, 32.0);
+            style.spacing.icon_width = 18.0;
+            style.spacing.icon_width_inner = 13.0;
+            style.spacing.icon_spacing = 5.0;
+            style.spacing.combo_width = 160.0;
+            style.spacing.window_margin = egui::Margin::same(10);
+
+            style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(14.0));
+            style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(17.0));
+            style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(16.0));
+            style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(16.0));
+            style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(29.0));
+        });
     }
 }
 
@@ -766,28 +1735,38 @@ fn install_cjk_font(ctx: &egui::Context) {
     use egui::FontDefinitions;
 
     let mut fonts = FontDefinitions::default();
-    let candidates: &[&str] = if cfg!(windows) {
+    // msyh.ttc 的第 1 个 face 是 Microsoft YaHei UI，更接近 Windows 普通桌面控件。
+    // 后续字体仅在前一个文件不存在时作为整套界面的回退字体。
+    let candidates: &[(&str, u32)] = if cfg!(windows) {
         &[
-            "C:\\Windows\\Fonts\\msyh.ttc",
-            "C:\\Windows\\Fonts\\msyhbd.ttc",
-            "C:\\Windows\\Fonts\\simhei.ttf",
-            "C:\\Windows\\Fonts\\simsun.ttc",
+            ("C:\\Windows\\Fonts\\msyh.ttc", 1),
+            ("C:\\Windows\\Fonts\\simhei.ttf", 0),
+            ("C:\\Windows\\Fonts\\simsun.ttc", 0),
         ]
     } else {
         &[
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-            "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+            ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+            ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 0),
+            ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
+            ("/usr/share/fonts/wqy-microhei/wqy-microhei.ttc", 0),
         ]
     };
-    for path in candidates {
+    for &(path, face_index) in candidates {
         if let Ok(bytes) = std::fs::read(path) {
-            fonts
-                .font_data
-                .insert("cjk".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+            let mut data = egui::FontData::from_owned(bytes);
+            data.index = face_index;
+            fonts.font_data.insert(
+                "system_ui".to_owned(),
+                std::sync::Arc::new(data),
+            );
             for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts.families.entry(family).or_default().push("cjk".to_owned());
+                let family_fonts = fonts.families.entry(family).or_default();
+                if cfg!(windows) {
+                    // 不再让 Ubuntu-Light/Hack 与中文字体混排，避免字宽、字重和基线不一致。
+                    family_fonts.insert(0, "system_ui".to_owned());
+                } else {
+                    family_fonts.push("system_ui".to_owned());
+                }
             }
             break;
         }
