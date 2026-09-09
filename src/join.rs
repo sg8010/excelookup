@@ -1,4 +1,4 @@
-//! Join 引擎:实现 VLOOKUP(left join)与 inner/right/full join
+//! Join 引擎:实现 VLOOKUP(left join)与 inner join
 //!
 //! 左表按「原列」输出;右表只输出「取值列」,避免键列重复。
 //! 键支持多列复合;归一化可配置:数字/文本互认+trim、中文/英文括号互认。
@@ -14,10 +14,6 @@ pub enum JoinType {
     Left,
     /// 只保留两表都能匹配的行
     Inner,
-    /// 保留右表所有行(右表行序),匹配不到左表补空
-    Right,
-    /// 两表所有行,未匹配侧补空(left 行先,right-only 行在后)
-    Full,
 }
 
 impl JoinType {
@@ -25,12 +21,10 @@ impl JoinType {
         match self {
             JoinType::Left => "左连接(VLOOKUP)",
             JoinType::Inner => "内连接(交集)",
-            JoinType::Right => "右连接",
-            JoinType::Full => "全连接(并集)",
         }
     }
-    pub fn all() -> [JoinType; 4] {
-        [JoinType::Left, JoinType::Inner, JoinType::Right, JoinType::Full]
+    pub fn all() -> [JoinType; 2] {
+        [JoinType::Left, JoinType::Inner]
     }
 
     /// 语义说明:每种连接类型对 A/B 两侧行的去留
@@ -38,8 +32,6 @@ impl JoinType {
         match self {
             JoinType::Left => "保留 A 的全部行",
             JoinType::Inner => "仅保留 A、B 都能匹配到的行",
-            JoinType::Right => "保留 B 的全部行",
-            JoinType::Full => "保留 A、B 的全部行",
         }
     }
 }
@@ -212,93 +204,34 @@ pub fn join(left: &Table, right: &Table, spec: &JoinSpec) -> JoinResult {
         v
     };
 
-    // ── 左表驱动(left / inner;full 也过左表;right 特殊:以右表为主) ──
-    if spec.join_type != JoinType::Right {
-        for row in &left.rows {
-            let key = make_key(row, lk, spec.key_mode);
-            let hit_idxs = key.as_ref().and_then(|k| index.get(k));
+    // ── 左表驱动(left / inner) ──
+    for row in &left.rows {
+        let key = make_key(row, lk, spec.key_mode);
+        let hit_idxs = key.as_ref().and_then(|k| index.get(k));
 
-            match hit_idxs {
-                Some(idxs) if !idxs.is_empty() => {
-                    left_matched += 1;
-                    for &ri in idxs {
-                        right_used[ri] = true;
-                        let mut o = row.clone();
-                        if has_pick {
-                            o.extend(pick_extra(ri));
-                        }
-                        out.push_row(o);
-                    }
-                }
-                // 无匹配
-                _ => {
-                    if spec.join_type == JoinType::Inner {
-                        continue; // inner:丢弃
-                    }
+        match hit_idxs {
+            Some(idxs) if !idxs.is_empty() => {
+                left_matched += 1;
+                for &ri in idxs {
+                    right_used[ri] = true;
                     let mut o = row.clone();
                     if has_pick {
-                        o.resize(o.len() + rp_valid.len(), CellValue::Empty);
+                        o.extend(pick_extra(ri));
                     }
                     out.push_row(o);
                 }
             }
-        }
-    } else {
-        // ── Right join:以右表为主序 ──
-        let lcols = left.col_count();
-        // 左表 key → 行(取第一个命中即可,与 left 相反方向)
-        let mut left_index: HashMap<String, Vec<usize>> = HashMap::new();
-        for (i, row) in left.rows.iter().enumerate() {
-            if let Some(k) = make_key(row, lk, spec.key_mode) {
-                left_index.entry(k).or_default().push(i);
-            }
-        }
-        for (i, row) in right.rows.iter().enumerate() {
-            let key = make_key(row, rk, spec.key_mode);
-            let hit = key.as_ref().and_then(|k| left_index.get(k));
-            match hit {
-                Some(idxs) if !idxs.is_empty() => {
-                    right_used[i] = true;
-                    left_matched += idxs.len();
-                    for &li in idxs {
-                        // 左表行 + 右表取值
-                        let mut o = left.rows[li].clone();
-                        if has_pick {
-                            o.extend(pick_extra(i));
-                        }
-                        out.push_row(o);
-                    }
+            // 无匹配
+            _ => {
+                if spec.join_type == JoinType::Inner {
+                    continue; // inner:丢弃
                 }
-                _ => {
-                    if make_key(row, rk, spec.key_mode).is_none() {
-                        continue; // 无键行跳过
-                    }
-                    let mut o: Vec<CellValue> = vec![CellValue::Empty; lcols];
-                    if has_pick {
-                        o.extend(pick_extra(i));
-                    }
-                    out.push_row(o);
+                let mut o = row.clone();
+                if has_pick {
+                    o.resize(o.len() + rp_valid.len(), CellValue::Empty);
                 }
+                out.push_row(o);
             }
-        }
-    }
-
-    // ── 右表独有行(full 才补;right 已在主循环处理) ──
-    if spec.join_type == JoinType::Full {
-        let lcols = left.col_count();
-        for (i, row) in right.rows.iter().enumerate() {
-            if right_used[i] {
-                continue;
-            }
-            // 无键行不参与 right-only(它从未可能匹配)
-            if make_key(row, rk, spec.key_mode).is_none() {
-                continue;
-            }
-            let mut o: Vec<CellValue> = vec![CellValue::Empty; lcols];
-            if has_pick {
-                o.extend(pick_extra(i));
-            }
-            out.push_row(o);
         }
     }
 
@@ -357,28 +290,6 @@ mod tests {
         assert_eq!(r.table.row_count(), 2);
         assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("x".into())));
         assert_eq!(r.table.cell(1, 1), Some(&CellValue::Text("y".into())));
-    }
-
-    #[test]
-    fn right_join_keeps_right_order() {
-        let a = tbl(&["id"], &[&["1"], &["2"]]);
-        let b = tbl(&["id", "v"], &[&["9", "z"], &["2", "x"]]);
-        let r = join(&a, &b, &spec(JoinType::Right, 0, 0, 1, KeyMode::EXACT));
-        // 右表顺序:9(z, 左空) → 2(x)
-        assert_eq!(r.table.row_count(), 2);
-        assert_eq!(r.table.cell(0, 0), Some(&CellValue::Empty));
-        assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("z".into())));
-        assert_eq!(r.table.cell(1, 0), Some(&CellValue::Text("2".into())));
-    }
-
-    #[test]
-    fn full_join_keeps_right_only() {
-        let a = tbl(&["id"], &[&["1"], &["2"]]);
-        let b = tbl(&["id", "v"], &[&["2", "x"], &["9", "z"]]);
-        let r = join(&a, &b, &spec(JoinType::Full, 0, 0, 1, KeyMode::EXACT));
-        assert_eq!(r.table.row_count(), 3);
-        assert_eq!(r.table.cell(2, 0), Some(&CellValue::Empty));
-        assert_eq!(r.table.cell(2, 1), Some(&CellValue::Text("z".into())));
     }
 
     #[test]

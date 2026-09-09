@@ -1439,8 +1439,6 @@ impl ExcelLookupApp {
         match join_type {
             JoinType::Left => "左连接",
             JoinType::Inner => "内连接",
-            JoinType::Right => "右连接",
-            JoinType::Full => "全连接",
         }
     }
 

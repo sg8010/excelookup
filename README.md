@@ -7,10 +7,11 @@
 
 ## 功能
 
-- **四种连接方式**
+- **连接方式**(A 恒为主表,想以 B 为主先「对调 A/B」)
   - 左连接(VLOOKUP 语义):保留主表所有行,匹配不到补空
-  - 内连接(交集)、右连接、全连接(并集)
+  - 内连接(交集):只保留两表都能匹配的行
 - **数据源灵活**:两个不同的 Excel 文件,或**同一个 Excel 的两个工作表**(每个数据源独立切换 Sheet)
+  - **对调 A/B**:一键互换主/匹配表,匹配列随表交换
 - **键匹配智能**
   - 键列任意选(可多列组合,后续版本开放多键 UI)
   - 宽松匹配:数字 `1001` 与文本 `"1001"` 视为相同,自动忽略首尾空格(可关闭)
@@ -66,7 +67,7 @@ sudo apt install -y gcc-mingw-w64-x86-64
 ## 测试
 
 ```bash
-cargo test        # 15 个测试:join 引擎单测 + 真实 xlsx 端到端
+cargo test        # 16 个测试:join 引擎单测 + 真实 xlsx 端到端
 ```
 
 ## 技术栈
@@ -88,7 +89,7 @@ src/
 ├── lib.rs         # 库入口
 ├── model.rs       # 数据模型 CellValue / Table
 ├── read_xlsx.rs   # 工作簿读取(多 Sheet)
-├── join.rs        # join 引擎(Left/Inner/Right/Full、复合键、宽松匹配)
+├── join.rs        # join 引擎(Left/Inner、复合键、宽松匹配)
 └── export.rs      # 导出 xlsx
 build.rs           # Windows 目标时把 assets/icon.ico 嵌入 exe(交叉编译也生效)
 assets/            # icon.png(窗口/任务栏图标)、icon.ico(exe 图标资源)
