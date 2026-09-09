@@ -70,6 +70,9 @@ pub struct JoinSpec {
     /// 右表取值列下标(结果中仅这些列来自右表)
     pub right_pick: Vec<usize>,
     pub key_mode: KeyMode,
+    /// 右表同键多行时是否全部展开。true=逐行展开(VLOOKUP 的重复键也取全);
+    /// false=只取第一条(经典 VLOOKUP 语义),避免结果行数爆炸。
+    pub expand_dup: bool,
 }
 
 /// join 结果
@@ -157,11 +160,38 @@ fn make_key(row: &[CellValue], cols: &[usize], mode: KeyMode) -> Option<String> 
     Some(parts.join("\u{1}"))
 }
 
+/// 预估左连接结果展开后的行数与 B 侧键重复诊断(不建行索引,只统计键出现次数;内存 = 键数)。
+/// 用于 GUI 在 join 前判断是否会爆炸(重复键展开成千万行),并给出诊断线索。
+/// 返回 (展开后预估行数, B 表单个键最大重复数, B 表键去重后个数)。
+pub fn estimate_join_rows(
+    left: &Table,
+    right: &Table,
+    lk: &[usize],
+    rk: &[usize],
+    mode: KeyMode,
+) -> (usize, usize, usize) {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for row in &right.rows {
+        if let Some(k) = make_key(row, rk, mode) {
+            *counts.entry(k).or_insert(0) += 1;
+        }
+    }
+    let max_dup = counts.values().copied().max().unwrap_or(0);
+    let distinct = counts.len();
+    let mut total = 0usize;
+    for row in &left.rows {
+        let key = make_key(row, lk, mode);
+        if let Some(n) = key.as_ref().and_then(|k| counts.get(k)) {
+            total = total.saturating_add(*n);
+        }
+    }
+    (total, max_dup, distinct)
+}
+
 pub fn join(left: &Table, right: &Table, spec: &JoinSpec) -> JoinResult {
     let lk = &spec.left_keys;
     let rk = &spec.right_keys;
 
-    // 右表取值列(过滤越界)
     let rp_valid: Vec<usize> = spec
         .right_pick
         .iter()
@@ -215,7 +245,9 @@ pub fn join(left: &Table, right: &Table, spec: &JoinSpec) -> JoinResult {
         match hit_idxs {
             Some(idxs) if !idxs.is_empty() => {
                 left_matched += 1;
-                for &ri in idxs {
+                // 重复键:默认全展开;expand_dup=false 时只取 B 中第一条(VLOOKUP 语义)
+                let take_n = if spec.expand_dup { idxs.len() } else { 1 };
+                for &ri in idxs.iter().take(take_n) {
                     right_used[ri] = true;
                     let mut o = row.clone();
                     if has_pick {
@@ -272,6 +304,7 @@ mod tests {
             right_keys: vec![rk],
             right_pick: vec![pick],
             key_mode: mode,
+            expand_dup: true,
         }
     }
 
@@ -324,6 +357,38 @@ mod tests {
     }
 
     #[test]
+    fn no_expand_dup_takes_first_only() {
+        // expand_dup=false:同 key 只取 B 第一条(经典 VLOOKUP),不展开
+        let a = tbl(&["id"], &[&["1"]]);
+        let b = tbl(&["id", "v"], &[&["1", "a"], &["1", "b"]]);
+        let mut sp = spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT);
+        sp.expand_dup = false;
+        let r = join(&a, &b, &sp);
+        assert_eq!(r.table.row_count(), 1);
+        assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("a".into())));
+        assert_eq!(r.row_hit, vec![true]);
+        assert_eq!(r.right_matched_rows, 1); // 只算实际用到的一条 B
+    }
+
+    #[test]
+    fn estimate_join_rows_counts_dup() {
+        // 3 个 A 键,每个在 B 命中 2 条 → 预估 6;B 最大单键重复 2,去重后 3
+        let a = tbl(&["id"], &[&["1"], &["2"], &["3"]]);
+        let b = tbl(
+            &["id", "v"],
+            &[&["1", "a"], &["1", "b"], &["2", "c"], &["2", "d"], &["3", "e"], &["3", "f"]],
+        );
+        let (est, max_dup, distinct) = estimate_join_rows(&a, &b, &[0], &[0], KeyMode::EXACT);
+        assert_eq!(est, 6);
+        assert_eq!(max_dup, 2);
+        assert_eq!(distinct, 3);
+        // 未匹配键不计数
+        let a2 = tbl(&["id"], &[&["9"]]);
+        let (est2, ..) = estimate_join_rows(&a2, &b, &[0], &[0], KeyMode::EXACT);
+        assert_eq!(est2, 0);
+    }
+
+    #[test]
     fn composite_key() {
         let a = tbl(&["k1", "k2", "v"], &[&["a", "1", "l1"]]);
         let b = tbl(&["k1", "k2", "w"], &[&["a", "1", "r1"], &["a", "2", "r2"]]);
@@ -336,6 +401,7 @@ mod tests {
                 right_keys: vec![0, 1],
                 right_pick: vec![2],
                 key_mode: KeyMode::EXACT,
+                expand_dup: true,
             },
         );
         assert_eq!(r.table.row_count(), 1);
@@ -381,6 +447,7 @@ mod tests {
                 right_keys: vec![0],
                 right_pick: vec![1, 2],
                 key_mode: KeyMode::EXACT,
+                expand_dup: true,
             },
         );
         assert_eq!(r.table.headers, vec!["id", "x", "y"]);

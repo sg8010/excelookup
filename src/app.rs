@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke};
 use egui_extras::{Column, TableBuilder};
 
-use excelookup_lib::join::{join, JoinSpec, JoinType, KeyMode};
+use excelookup_lib::join::{estimate_join_rows, join, JoinSpec, JoinType, KeyMode};
 use excelookup_lib::model::{CellValue, Table};
 
 /// 后台加载线程回主线程的消息(数据 move,不 clone)
@@ -85,6 +85,8 @@ pub struct ExcelLookupApp {
     normalize_keys: bool,
     /// UI 用的括号归一化开关(中文/英文括号互认)
     bracket_fold: bool,
+    /// B 同键多行是否全部展开(true=展开成多行,false=只取第一条即 VLOOKUP 语义)
+    expand_dup: bool,
     result: Option<JoinOutcome>,
     /// 结果表行筛选状态(点击指标卡片切换;None=全部)
     row_filter: Option<RowFilter>,
@@ -119,6 +121,12 @@ struct JoinOutcome {
     out_rows: usize,
     /// 输出表每行是否命中(与 table.rows 对齐)
     row_hit: Vec<bool>,
+    /// 命中行数(结果表口径;预计算避免每帧全扫 row_hit)
+    matched_rows: usize,
+    /// 未命中行数(结果表口径)
+    unmatched_rows: usize,
+    /// 本次执行是否展开重复键(结果展示说明用)
+    expand_dup: bool,
     err: Option<String>,
     join_type: JoinType,
 }
@@ -191,6 +199,7 @@ impl Default for ExcelLookupApp {
             right_pick_cols: vec![],
             normalize_keys: true,
             bracket_fold: true,
+            expand_dup: true,
             result: None,
             row_filter: None,
             load_rx: None,
@@ -350,6 +359,9 @@ impl ExcelLookupApp {
                 right_total: 0,
                 out_rows: 0,
                 row_hit: vec![],
+                matched_rows: 0,
+                unmatched_rows: 0,
+                expand_dup: false,
                 err: Some("请先加载两个数据源".into()),
                 join_type: self.join_type,
             });
@@ -375,6 +387,9 @@ impl ExcelLookupApp {
                 right_total: 0,
                 out_rows: 0,
                 row_hit: vec![],
+                matched_rows: 0,
+                unmatched_rows: 0,
+                expand_dup: false,
                 err: Some("当前工作表无列数据".into()),
                 join_type: self.join_type,
             });
@@ -391,6 +406,9 @@ impl ExcelLookupApp {
                 right_total: 0,
                 out_rows: 0,
                 row_hit: vec![],
+                matched_rows: 0,
+                unmatched_rows: 0,
+                expand_dup: false,
                 err: Some("请先在连接配置中选择 A/B 匹配列".into()),
                 join_type: self.join_type,
             });
@@ -406,14 +424,103 @@ impl ExcelLookupApp {
             .filter(|&c| c < rc)
             .collect();
 
+        // 重复键展开防爆:预估展开后行数,超阈值直接报错阻止(避免千万行把 GUI/内存拖垮)
+        const MAX_EXPAND_ROWS: usize = 5_000_000;
+        if self.expand_dup {
+            let (est, max_dup, distinct) = estimate_join_rows(
+                left_t,
+                right_t,
+                &[lk],
+                &[rk],
+                self.key_mode(),
+            );
+            if est > MAX_EXPAND_ROWS {
+                // 单位自适应:≥1 亿用亿,≥1 万用万,否则原样
+                let fmt = |n: usize| -> String {
+                    if n >= 100_000_000 {
+                        format!("{:.1} 亿", n as f64 / 100_000_000.0)
+                    } else if n >= 10_000 {
+                        format!("{:.1} 万", n as f64 / 10_000.0)
+                    } else {
+                        n.to_string()
+                    }
+                };
+                let a_rows = left_t.row_count();
+                let b_rows = right_t.row_count();
+
+                // 诊断段落(多行;首行=标题,随后按行渲染)
+                let mut lines: Vec<String> = Vec::new();
+                lines.push(format!(
+                    "重复键展开后结果约 {} 行,远超可处理范围,已中止。",
+                    fmt(est)
+                ));
+                lines.push(String::new());
+                lines.push("【数据诊断】".into());
+                lines.push(format!(
+                    "· A 表(主表)共 {a_rows} 行;B 表(匹配表)共 {b_rows} 行。"
+                ));
+
+                // 原因定位:先看 B 键重复度,再看单键极端值
+                if distinct > 0 && b_rows >= 10 && b_rows / distinct >= 10 {
+                    lines.push(format!(
+                        "· B 表键列几乎不唯一:{} 行只有 {} 个不同键值,单键最多重复 {} 次。",
+                        fmt(b_rows),
+                        fmt(distinct),
+                        fmt(max_dup)
+                    ));
+                    lines.push("· 原因:匹配列很可能选成了“分类/枚举”类列(如省份、状态、类型),而非唯一编号列。".into());
+                } else if max_dup > 1000 {
+                    lines.push(format!(
+                        "· B 表键列存在单键重复 {} 次的极端值(去重后共 {} 个键)。",
+                        fmt(max_dup),
+                        fmt(distinct)
+                    ));
+                    lines.push("· 原因:B 表存在大量同键行,可能数据本身重复,或键列粒度过粗。".into());
+                } else {
+                    lines.push(format!(
+                        "· B 表键去重后 {} 个(共 {} 行),A 表 {a_rows} 行平均每键命中多条。",
+                        fmt(distinct),
+                        fmt(b_rows)
+                    ));
+                    lines.push("· 原因:A 与 B 的匹配列粒度不匹配(如明细对汇总),导致普遍一对多。".into());
+                }
+
+                lines.push(String::new());
+                lines.push("【排查步骤】".into());
+                lines.push("1. 返回“连接配置”,检查 A、B 两表的匹配列是否都选了编号/ID 类唯一列。".into());
+                lines.push("2. 在“数据源”页确认 B 表:健康键列的去重个数应接近表行数(如 39 万行应有几十万个不同键)。".into());
+                lines.push("3. 若 B 表确实同键多行(如一人多条记录),请关闭“重复键展开”开关(只取第一条,VLOOKUP 风格)。".into());
+                lines.push("4. 若确认键列无误仍过大,可先对 A 表筛选/去重后再连接。".into());
+
+                self.result = Some(JoinOutcome {
+                    table: Table::default(),
+                    left_matched: 0,
+                    left_total: 0,
+                    right_matched_rows: 0,
+                    right_total: 0,
+                    out_rows: 0,
+                    row_hit: vec![],
+                    matched_rows: 0,
+                    unmatched_rows: 0,
+                    expand_dup: true,
+                    err: Some(lines.join("\n")),
+                    join_type: self.join_type,
+                });
+                self.step = WorkflowStep::Result;
+                return;
+            }
+        }
+
         let spec = JoinSpec {
             join_type: self.join_type,
             left_keys: vec![lk],
             right_keys: vec![rk],
             right_pick: rp,
             key_mode: self.key_mode(),
+            expand_dup: self.expand_dup,
         };
         let res = join(left_t, right_t, &spec);
+        let matched_rows = res.row_hit.iter().filter(|&&h| h).count();
         self.result = Some(JoinOutcome {
             table: res.table,
             left_matched: res.left_matched,
@@ -421,7 +528,10 @@ impl ExcelLookupApp {
             right_matched_rows: res.right_matched_rows,
             right_total: res.right_total,
             out_rows: res.out_rows,
+            matched_rows,
+            unmatched_rows: res.row_hit.len() - matched_rows,
             row_hit: res.row_hit,
+            expand_dup: self.expand_dup,
             err: None,
             join_type: self.join_type,
         });
@@ -1505,6 +1615,21 @@ impl ExcelLookupApp {
                         .size(12.0)
                         .color(Self::soft()),
                 );
+                ui.add_space(15.0);
+                Self::toggle_switch(ui, &mut self.expand_dup, "重复键展开");
+                if self.expand_dup {
+                    ui.label(
+                        egui::RichText::new("B 同键多行全部带出")
+                            .size(12.0)
+                            .color(Self::soft()),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("B 同键多行只取第一条（VLOOKUP 风格）")
+                            .size(12.0)
+                            .color(Self::amber()),
+                    );
+                }
             });
         });
 
@@ -1614,22 +1739,73 @@ impl ExcelLookupApp {
             return;
         };
         if let Some(error) = &result.err {
-            ui.colored_label(Self::amber(), format!("⚠ {error}"));
-            Self::action_row(ui, "请返回连接配置检查数据", |ui| {
-                if Self::secondary_button(ui, "返回配置", 90.0).clicked() {
-                    self.go_to_step(WorkflowStep::Configure);
+            // 诊断错误卡片:首行标题,后续分段(空行分隔的【】小节 + 条目)
+            // 先拷贝错误文本,避免闭包内再可变借用 self
+            let err_text = error.clone();
+            let has_diag = err_text.contains("【数据诊断】");
+            let mut go_config = false;
+            let mut disable_expand = false;
+            Self::card_frame(Self::surface(), Self::line(), 16).show(ui, |ui| {
+                ui.set_min_width(600.0);
+                let mut lines = err_text.lines();
+                // 标题行
+                if let Some(head) = lines.next() {
+                    ui.label(
+                        egui::RichText::new(format!("⚠ {head}"))
+                            .size(15.0)
+                            .strong()
+                            .color(Self::amber()),
+                    );
                 }
+                ui.add_space(6.0);
+                // 分段渲染:空行分隔小节,【】开头的行作小标题,其余作正文
+                for l in lines {
+                    let t = l.trim();
+                    if t.is_empty() {
+                        ui.add_space(8.0);
+                        continue;
+                    }
+                    if t.starts_with("【") {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(t).size(13.0).strong().color(Self::ink()));
+                        ui.add_space(2.0);
+                    } else {
+                        ui.label(
+                            egui::RichText::new(t.trim_start_matches("· "))
+                                .size(13.0)
+                                .color(Self::ink()),
+                        );
+                    }
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if Self::primary_button(ui, "返回连接配置", 130.0, true).clicked() {
+                        go_config = true;
+                    }
+                    if has_diag && Self::secondary_button(ui, "关闭重复键展开", 150.0).clicked() {
+                        disable_expand = true;
+                    }
+                });
             });
+            if go_config {
+                self.go_to_step(WorkflowStep::Configure);
+            }
+            if disable_expand {
+                self.expand_dup = false;
+                self.go_to_step(WorkflowStep::Configure);
+            }
             return;
         }
 
         let left_total = result.left_total;
         let left_matched = result.left_matched;
-        let left_unmatched = left_total.saturating_sub(left_matched);
         let right_total = result.right_total;
         let right_matched = result.right_matched_rows;
         let out_rows = result.out_rows;
         let join_label = result.join_type.label();
+        // row_hit 预计算计数(结果表口径;重复键展开时命中行数可能 > A 命中行数)
+        let matched_rows = result.matched_rows;
+        let unmatched_rows = result.unmatched_rows;
 
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(join_label).size(13.0).strong().color(Self::blue()));
@@ -1657,9 +1833,9 @@ impl ExcelLookupApp {
             let matched_resp = Self::metric_card(
                 &mut cols[1],
                 "已匹配",
-                &left_matched.to_string(),
+                &matched_rows.to_string(),
                 &format!(
-                    "匹配率 {:.1}%",
+                    "A 命中 {left_matched} 行 · 匹配率 {:.1}%",
                     if left_total == 0 {
                         0.0
                     } else {
@@ -1673,7 +1849,7 @@ impl ExcelLookupApp {
             let unmatched_resp = Self::metric_card(
                 &mut cols[2],
                 "未命中",
-                &left_unmatched.to_string(),
+                &unmatched_rows.to_string(),
                 if self.row_filter == Some(RowFilter::Unmatched) {
                     "再次点击取消筛选"
                 } else {
@@ -1687,7 +1863,11 @@ impl ExcelLookupApp {
                 &mut cols[3],
                 "结果行数",
                 &out_rows.to_string(),
-                "含重复键展开",
+                if result.expand_dup {
+                    "含重复键展开"
+                } else {
+                    "重复键只取第一条"
+                },
                 Self::muted(),
                 false,
                 false,
@@ -1711,8 +1891,6 @@ impl ExcelLookupApp {
 
         ui.add_space(17.0);
         // 按当前筛选显示对应行数(总行数 / 已匹配 / 未命中)
-        let matched_rows = result.row_hit.iter().filter(|&&h| h).count();
-        let unmatched_rows = result.row_hit.len() - matched_rows;
         let shown_total = match self.row_filter {
             Some(RowFilter::Matched) => matched_rows,
             Some(RowFilter::Unmatched) => unmatched_rows,
