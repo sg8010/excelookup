@@ -83,6 +83,8 @@ pub struct JoinResult {
     /// 右表行中被匹配过的行数
     pub right_matched_rows: usize,
     pub out_rows: usize,
+    /// 输出表每行是否命中(与 table.rows 对齐;左连接未匹配的 A 行 = false,内连接全 true)
+    pub row_hit: Vec<bool>,
 }
 
 /// 中文括号 → 对应英文括号(括号归一化)
@@ -185,6 +187,7 @@ pub fn join(left: &Table, right: &Table, spec: &JoinSpec) -> JoinResult {
         }
     }
     let mut out = Table::new(headers);
+    let mut row_hit: Vec<bool> = Vec::new();
 
     let mut left_matched = 0usize;
     let mut right_used: Vec<bool> = vec![false; right.rows.len()];
@@ -219,6 +222,7 @@ pub fn join(left: &Table, right: &Table, spec: &JoinSpec) -> JoinResult {
                         o.extend(pick_extra(ri));
                     }
                     out.push_row(o);
+                    row_hit.push(true);
                 }
             }
             // 无匹配
@@ -231,6 +235,7 @@ pub fn join(left: &Table, right: &Table, spec: &JoinSpec) -> JoinResult {
                     o.resize(o.len() + rp_valid.len(), CellValue::Empty);
                 }
                 out.push_row(o);
+                row_hit.push(false);
             }
         }
     }
@@ -244,6 +249,7 @@ pub fn join(left: &Table, right: &Table, spec: &JoinSpec) -> JoinResult {
         right_total: right.rows.len(),
         right_matched_rows,
         out_rows,
+        row_hit,
     }
 }
 
@@ -290,6 +296,18 @@ mod tests {
         assert_eq!(r.table.row_count(), 2);
         assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("x".into())));
         assert_eq!(r.table.cell(1, 1), Some(&CellValue::Text("y".into())));
+        // inner:未命中行被丢弃,输出全为命中行
+        assert_eq!(r.row_hit, vec![true, true]);
+    }
+
+    #[test]
+    fn row_hit_marks_left_unmatched() {
+        // 左连接:匹配上的行 hit=true;未匹配 A 行(补空)hit=false
+        let a = tbl(&["id"], &[&["1"], &["2"], &["3"]]);
+        let b = tbl(&["id", "v"], &[&["1", "x"], &["3", "y"]]);
+        let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT));
+        assert_eq!(r.table.row_count(), 3);
+        assert_eq!(r.row_hit, vec![true, false, true]);
     }
 
     #[test]
@@ -301,6 +319,8 @@ mod tests {
         assert_eq!(r.table.row_count(), 2);
         assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("a".into())));
         assert_eq!(r.table.cell(1, 1), Some(&CellValue::Text("b".into())));
+        // 展开的两行都算命中
+        assert_eq!(r.row_hit, vec![true, true]);
     }
 
     #[test]

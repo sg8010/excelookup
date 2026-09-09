@@ -75,13 +75,22 @@ pub struct ExcelLookupApp {
     /// UI 用的括号归一化开关(中文/英文括号互认)
     bracket_fold: bool,
     result: Option<JoinOutcome>,
-    /// 结果预览中的文本筛选条件(仅影响 UI,不改变导出内容)。
-    result_filter: String,
+    /// 结果表行筛选状态(点击指标卡片切换;None=全部)
+    row_filter: Option<RowFilter>,
     /// 延迟到帧末处理(避免借用冲突)
     pending_open: Option<(Side, PathBuf)>,
     pending_save: bool,
     /// 对调 A/B 后帧末统一处理(重置键列/输出列/结果)
     pending_swap: bool,
+}
+
+/// 结果表行筛选(点击对应指标卡激活,再次点击取消)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowFilter {
+    /// 只看命中的行
+    Matched,
+    /// 只看未命中的行
+    Unmatched,
 }
 
 struct JoinOutcome {
@@ -91,6 +100,8 @@ struct JoinOutcome {
     right_matched_rows: usize,
     right_total: usize,
     out_rows: usize,
+    /// 输出表每行是否命中(与 table.rows 对齐)
+    row_hit: Vec<bool>,
     err: Option<String>,
     join_type: JoinType,
 }
@@ -155,7 +166,7 @@ impl Default for ExcelLookupApp {
             normalize_keys: true,
             bracket_fold: true,
             result: None,
-            result_filter: String::new(),
+            row_filter: None,
             pending_open: None,
             pending_save: false,
             pending_swap: false,
@@ -219,7 +230,7 @@ impl ExcelLookupApp {
         // 该侧表已整体替换:键列/输出列需重新选择
         self.reset_side_on_source_change(side);
         self.result = None;
-        self.result_filter.clear();
+        self.row_filter = None;
     }
 
     /// 切换 sheet(切换后清结果、校正键列)
@@ -235,7 +246,7 @@ impl ExcelLookupApp {
         // 该侧表已切换:键列/输出列需重新选择
         self.reset_side_on_source_change(side);
         self.result = None;
-        self.result_filter.clear();
+        self.row_filter = None;
         if self.step == WorkflowStep::Result {
             self.step = WorkflowStep::Configure;
         }
@@ -264,6 +275,7 @@ impl ExcelLookupApp {
                 right_matched_rows: 0,
                 right_total: 0,
                 out_rows: 0,
+                row_hit: vec![],
                 err: Some("请先加载两个数据源".into()),
                 join_type: self.join_type,
             });
@@ -288,6 +300,7 @@ impl ExcelLookupApp {
                 right_matched_rows: 0,
                 right_total: 0,
                 out_rows: 0,
+                row_hit: vec![],
                 err: Some("当前工作表无列数据".into()),
                 join_type: self.join_type,
             });
@@ -303,6 +316,7 @@ impl ExcelLookupApp {
                 right_matched_rows: 0,
                 right_total: 0,
                 out_rows: 0,
+                row_hit: vec![],
                 err: Some("请先在连接配置中选择 A/B 匹配列".into()),
                 join_type: self.join_type,
             });
@@ -333,10 +347,11 @@ impl ExcelLookupApp {
             right_matched_rows: res.right_matched_rows,
             right_total: res.right_total,
             out_rows: res.out_rows,
+            row_hit: res.row_hit,
             err: None,
             join_type: self.join_type,
         });
-        self.result_filter.clear();
+        self.row_filter = None;
         self.step = WorkflowStep::Result;
     }
 
@@ -361,7 +376,7 @@ impl ExcelLookupApp {
 
     fn clear_result(&mut self) {
         self.result = None;
-        self.result_filter.clear();
+        self.row_filter = None;
         if self.sources_ready() {
             self.step = WorkflowStep::Configure;
         }
@@ -374,7 +389,7 @@ impl ExcelLookupApp {
         self.right_key_col = None;
         self.right_pick_cols.clear();
         self.result = None;
-        self.result_filter.clear();
+        self.row_filter = None;
         self.step = WorkflowStep::Sources;
     }
 
@@ -387,7 +402,7 @@ impl ExcelLookupApp {
         std::mem::swap(&mut self.left_key_col, &mut self.right_key_col);
         self.right_pick_cols.clear();
         self.result = None;
-        self.result_filter.clear();
+        self.row_filter = None;
         self.step = WorkflowStep::Sources;
     }
 
@@ -1563,8 +1578,16 @@ impl ExcelLookupApp {
         ui.add_space(13.0);
 
         ui.columns(4, |cols| {
-            Self::metric_card(&mut cols[0], "A 主表行数", &left_total.to_string(), "全部保留", Self::blue());
             Self::metric_card(
+                &mut cols[0],
+                "A 主表行数",
+                &left_total.to_string(),
+                "全部保留",
+                Self::blue(),
+                false,
+                false,
+            );
+            let matched_resp = Self::metric_card(
                 &mut cols[1],
                 "已匹配",
                 &left_matched.to_string(),
@@ -1577,13 +1600,21 @@ impl ExcelLookupApp {
                     }
                 ),
                 Self::teal(),
+                true,
+                self.row_filter == Some(RowFilter::Matched),
             );
-            Self::metric_card(
+            let unmatched_resp = Self::metric_card(
                 &mut cols[2],
                 "未命中",
                 &left_unmatched.to_string(),
-                "建议检查匹配列",
+                if self.row_filter == Some(RowFilter::Unmatched) {
+                    "再次点击取消筛选"
+                } else {
+                    "点击仅看未命中行"
+                },
                 Self::amber(),
+                true,
+                self.row_filter == Some(RowFilter::Unmatched),
             );
             Self::metric_card(
                 &mut cols[3],
@@ -1591,28 +1622,59 @@ impl ExcelLookupApp {
                 &out_rows.to_string(),
                 "含重复键展开",
                 Self::muted(),
+                false,
+                false,
             );
+
+            if matched_resp.clicked() {
+                self.row_filter = if self.row_filter == Some(RowFilter::Matched) {
+                    None
+                } else {
+                    Some(RowFilter::Matched)
+                };
+            }
+            if unmatched_resp.clicked() {
+                self.row_filter = if self.row_filter == Some(RowFilter::Unmatched) {
+                    None
+                } else {
+                    Some(RowFilter::Unmatched)
+                };
+            }
         });
 
         ui.add_space(17.0);
+        // 按当前筛选显示对应行数(总行数 / 已匹配 / 未命中)
+        let matched_rows = result.row_hit.iter().filter(|&&h| h).count();
+        let unmatched_rows = result.row_hit.len() - matched_rows;
+        let shown_total = match self.row_filter {
+            Some(RowFilter::Matched) => matched_rows,
+            Some(RowFilter::Unmatched) => unmatched_rows,
+            None => result.table.row_count(),
+        };
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("结果预览").size(15.0).strong().color(Self::ink()));
             ui.label(
-                egui::RichText::new(format!(
-                    "{} 行 × {} 列",
-                    result.table.row_count(),
-                    result.table.col_count()
-                ))
-                .size(12.0)
-                .color(Self::muted()),
+                egui::RichText::new(format!("{shown_total} 行 × {} 列", result.table.col_count()))
+                    .size(12.0)
+                    .color(Self::muted()),
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let edit = egui::TextEdit::singleline(&mut self.result_filter)
-                    .hint_text("筛选结果")
-                    .desired_width(180.0)
-                    .font(egui::TextStyle::Small);
-                ui.add(edit);
-            });
+            match self.row_filter {
+                Some(RowFilter::Matched) => {
+                    ui.label(
+                        egui::RichText::new("· 只看已匹配")
+                            .size(12.0)
+                            .color(Self::teal()),
+                    );
+                }
+                Some(RowFilter::Unmatched) => {
+                    ui.label(
+                        egui::RichText::new("· 只看未命中")
+                            .size(12.0)
+                            .color(Self::amber()),
+                    );
+                }
+                None => {}
+            }
         });
         ui.add_space(8.0);
         self.ui_result_table(ui);
@@ -1624,25 +1686,61 @@ impl ExcelLookupApp {
         });
     }
 
-    fn metric_card(ui: &mut egui::Ui, label: &str, value: &str, note: &str, accent: Color32) {
-        Self::card_frame(Self::surface(), Self::line(), 9).show(ui, |ui| {
-            ui.set_min_height(70.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(label).size(12.0).color(Self::muted()));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    egui::Frame::new()
-                        .inner_margin(egui::Margin::same(4))
-                        .fill(accent.gamma_multiply(0.10))
-                        .corner_radius(CornerRadius::ZERO)
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new("▦").size(13.0).color(accent));
-                        });
+    /// 指标卡;返回整卡可点击的 Response(用于未命中筛选交互)
+    /// `active` = 是否处于激活(筛选)态,改变描边/底色提示可再点取消
+    fn metric_card(
+        ui: &mut egui::Ui,
+        label: &str,
+        value: &str,
+        note: &str,
+        accent: Color32,
+        clickable: bool,
+        active: bool,
+    ) -> egui::Response {
+        let stroke_color = if active {
+            accent
+        } else if clickable {
+            Self::line_strong()
+        } else {
+            Self::line()
+        };
+        let stroke_w = if active { 2.0 } else { 1.0 };
+        let fill = if active {
+            accent.gamma_multiply(0.08)
+        } else {
+            Self::surface()
+        };
+        let inner = Self::card_frame(fill, stroke_color, 9)
+            .stroke(Stroke::new(stroke_w, stroke_color))
+            .show(ui, |ui| {
+                ui.set_min_height(70.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(label).size(12.0).color(Self::muted()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin::same(4))
+                            .fill(accent.gamma_multiply(0.10))
+                            .corner_radius(CornerRadius::ZERO)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("▦").size(13.0).color(accent));
+                            });
+                    });
                 });
+                ui.add_space(7.0);
+                ui.label(egui::RichText::new(value).size(24.0).strong().color(Self::ink()));
+                ui.label(egui::RichText::new(note).size(11.0).color(accent));
             });
-            ui.add_space(7.0);
-            ui.label(egui::RichText::new(value).size(24.0).strong().color(Self::ink()));
-            ui.label(egui::RichText::new(note).size(11.0).color(accent));
-        });
+        let sense = if clickable {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        ui.interact(inner.response.rect, ui.id().with(("metric", label)), sense)
+            .on_hover_cursor(if clickable {
+                egui::CursorIcon::PointingHand
+            } else {
+                egui::CursorIcon::Default
+            })
     }
 
     fn ui_result_table(&self, ui: &mut egui::Ui) {
@@ -1654,23 +1752,23 @@ impl ExcelLookupApp {
         let table = &result.table;
         let headers = table.headers.clone();
         let ncols = table.col_count();
-        let filter = self.result_filter.trim().to_lowercase();
-        let visible_rows: Option<Vec<usize>> = if filter.is_empty() {
-            None
-        } else {
-            Some(
+        // 行筛选:已匹配/未命中(按 row_hit 标记过滤);None=全部
+        let row_filter = self.row_filter;
+        let row_hit = &result.row_hit;
+        let visible_rows: Option<Vec<usize>> = match row_filter {
+            Some(f) => Some(
                 table
                     .rows
                     .iter()
                     .enumerate()
-                    .filter_map(|(index, row)| {
-                        let found = row
-                            .iter()
-                            .any(|cell| cell.display().to_lowercase().contains(&filter));
-                        found.then_some(index)
+                    .filter_map(|(index, _)| {
+                        let hit = row_hit.get(index).copied().unwrap_or(true);
+                        let want_hit = matches!(f, RowFilter::Matched);
+                        (hit == want_hit).then_some(index)
                     })
                     .collect(),
-            )
+            ),
+            None => None,
         };
         let row_count = visible_rows
             .as_ref()
@@ -1678,7 +1776,12 @@ impl ExcelLookupApp {
             .unwrap_or(table.row_count());
 
         if row_count == 0 {
-            ui.label(egui::RichText::new("没有符合条件的行").size(13.0).color(Self::muted()));
+            let msg = match row_filter {
+                Some(RowFilter::Matched) => "没有已匹配的行（当前连接类型下全部未命中）",
+                Some(RowFilter::Unmatched) => "没有未命中的行（当前连接类型下全部命中）",
+                None => "没有符合条件的行",
+            };
+            ui.label(egui::RichText::new(msg).size(13.0).color(Self::muted()));
             return;
         }
 
