@@ -1568,9 +1568,12 @@ impl ExcelLookupApp {
         let text_h = ui.text_style_height(&egui::TextStyle::Body);
         let row_h = (text_h + 7.0).max(22.0);
         let sep_color = Self::line();
+        // 预览表只读：关闭每个单元格的 hover 命中和列拖拽检测，避免鼠标移动时
+        // 对整张表重复做大量交互命中计算。
         let mut builder = TableBuilder::new(ui)
             .striped(true)
-            .resizable(true)
+            .resizable(false)
+            .sense(egui::Sense::empty())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .vscroll(true)
             .max_scroll_height(300.0);
@@ -1598,14 +1601,17 @@ impl ExcelLookupApp {
                         .unwrap_or(row.index());
                     for column in 0..ncols {
                         row.col(|ui| {
-                            let value = table
-                                .cell(index, column)
-                                .cloned()
-                                .unwrap_or(CellValue::Empty);
-                            if value == CellValue::Empty {
-                                ui.label(egui::RichText::new("—").size(13.0).color(Self::soft()));
-                            } else {
-                                ui.label(egui::RichText::new(value.display()).size(13.0).color(Self::ink()));
+                            match table.cell(index, column) {
+                                None | Some(CellValue::Empty) => {
+                                    ui.label(egui::RichText::new("—").size(13.0).color(Self::soft()));
+                                }
+                                Some(value) => {
+                                    ui.label(
+                                        egui::RichText::new(value.display())
+                                            .size(13.0)
+                                            .color(Self::ink()),
+                                    );
+                                }
                             }
                             let rect = ui.max_rect();
                             let painter = ui.painter();
