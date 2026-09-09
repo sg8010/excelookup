@@ -42,7 +42,8 @@ jobs:
 
       - name: 检查产物 glibc 需求
         run: |
-          file target/release/excelookup
+          echo "=== 文件类型 ==="
+          readelf -h target/release/excelookup | grep -E "Class|Machine"
           echo "=== 需求的最高 glibc 符号版本 ==="
           objdump -T target/release/excelookup 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -5
           echo "=== 最大版本号 ==="
@@ -51,6 +52,7 @@ jobs:
           readelf -d target/release/excelookup | grep NEEDED | awk '{print $NF}'
 
       - name: 上传产物
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: excelookup-buster-arm64
