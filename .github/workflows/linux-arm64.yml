@@ -10,13 +10,29 @@ permissions:
 
 jobs:
   build-linux-arm64:
-    name: Build Linux arm64 (release)
+    name: Build Linux arm64 (glibc 2.28)
     runs-on: ubuntu-24.04-arm
+    # debian:buster = glibc 2.28,与目标平台一致;容器内编译保证产物
+    # glibc 需求 ≤ 2.28(在 24.04 runner 上直接编译会要求 glibc 2.39,无法在 2.28 机器运行)
+    container:
+      image: debian:buster
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: 切到 archive 源 (buster 已 EOL)
+        run: |
+          printf '%s\n' \
+            'deb http://archive.debian.org/debian/ buster main' \
+            'deb http://archive.debian.org/debian/ buster-updates main' \
+            'deb http://archive.debian.org/debian-security/ buster/updates main' \
+            > /etc/apt/sources.list
+          apt-get -o Acquire::Check-Valid-Until=false update
+
+      - name: 装 rustup + gcc
+        run: |
+          apt-get install -y --no-install-recommends curl ca-certificates gcc libc6-dev
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -27,10 +43,20 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
-      - name: Verify binary
+      - name: 校验产物 glibc 需求 ≤ 2.28
         run: |
-          file target/release/excelookup
-          du -h target/release/excelookup
+          echo "=== 文件类型 ==="
+          readelf -h target/release/excelookup | grep -E "Class|Machine"
+          echo "=== 最高 glibc 符号版本 ==="
+          objdump -T target/release/excelookup 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -3
+          MAX=$(objdump -T target/release/excelookup 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' | sed 's/GLIBC_//' | sort -V | tail -1)
+          echo "最高需求 glibc: $MAX"
+          HIGH=$(printf '%s\n' "$MAX" "2.28" | sort -V | tail -1)
+          if [ "$HIGH" != "2.28" ]; then
+            echo "❌ 产物要求 glibc $MAX,超过目标 2.28"
+            exit 1
+          fi
+          echo "✅ 产物 glibc 需求 ≤ 2.28"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
