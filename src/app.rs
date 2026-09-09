@@ -574,7 +574,7 @@ impl ExcelLookupApp {
     fn green_button(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
         ui.add(
             egui::Button::new(egui::RichText::new(text).strong().color(Color32::WHITE))
-                .min_size(egui::vec2(width, 36.0))
+                .min_size(egui::vec2(width, 42.0))
                 .fill(Self::teal())
                 .stroke(Stroke::NONE)
                 .corner_radius(CornerRadius::ZERO),
@@ -698,36 +698,13 @@ impl ExcelLookupApp {
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.label(
-                egui::RichText::new("ExcelLookup 0.2 · 跨平台桌面版")
+                egui::RichText::new(format!(
+                    "ExcelLookup {}",
+                    option_env!("EXCELOOKUP_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+                ))
                     .size(12.0)
                     .color(Self::sidebar_faint()),
             );
-            ui.add_space(15.0);
-            egui::Frame::new()
-                .inner_margin(egui::Margin::same(12))
-                .fill(Color32::from_rgba_unmultiplied(11, 26, 44, 62))
-                .stroke(Stroke::new(
-                    1.0,
-                    Color32::from_rgba_unmultiplied(157, 180, 207, 38),
-                ))
-                .corner_radius(CornerRadius::ZERO)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("♢").size(17.0).color(Self::teal_soft()));
-                        ui.label(
-                            egui::RichText::new("数据仅在本机处理")
-                                .size(14.0)
-                                .strong()
-                                .color(Self::sidebar_text()),
-                        );
-                    });
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("文件不会上传云端，适合处理内部与敏感数据。")
-                            .size(13.0)
-                            .color(Self::sidebar_muted()),
-                    );
-                });
         });
     }
 
@@ -906,7 +883,8 @@ impl ExcelLookupApp {
         }
     }
 
-    fn ui_page_heading(&self, ui: &mut egui::Ui) {
+    fn ui_page_heading(&mut self, ui: &mut egui::Ui) {
+        let show_export = self.step == WorkflowStep::Result && self.result_ready();
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
@@ -930,8 +908,14 @@ impl ExcelLookupApp {
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
+                if show_export {
+                    if Self::green_button(ui, "导出结果  ↓", 136.0).clicked() {
+                        self.pending_save = true;
+                    }
+                    ui.add_space(16.0);
+                }
                 ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("♢").size(18.0).color(Self::blue()));
+                    ui.label(egui::RichText::new("♢").size(18.0).color(Self::blue()));
                     ui.label(
                         egui::RichText::new("适用于 VLOOKUP 与多表合并")
                             .size(13.0)
@@ -1144,7 +1128,7 @@ impl ExcelLookupApp {
                 ui.label(
                     egui::RichText::new(match side {
                         Side::Left => "✓ 将保留主表全部行",
-                        Side::Right => "✓ 可从匹配表带出客户信息",
+                        Side::Right => "✓ 可从匹配表带出所需要的行",
                     })
                     .size(12.0)
                     .color(Self::teal()),
@@ -1516,10 +1500,7 @@ impl ExcelLookupApp {
         ui.add_space(8.0);
         self.ui_result_table(ui);
 
-        Self::action_row(ui, "确认无误后导出为新的工作簿", |ui| {
-            if Self::green_button(ui, "导出结果  ↓", 112.0).clicked() {
-                self.pending_save = true;
-            }
+        Self::action_row(ui, "结果已生成，可返回配置调整", |ui| {
             if Self::secondary_button(ui, "返回配置", 88.0).clicked() {
                 self.go_to_step(WorkflowStep::Configure);
             }

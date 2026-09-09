@@ -1,9 +1,17 @@
 //! 构建脚本:仅 Windows 目标时,把 assets/icon.ico 嵌入 .exe 资源
 //! (资源管理器 / 任务栏 / Alt-Tab 图标)。Linux / CI arm64 构建直接跳过。
 
-use std::path::PathBuf;
+use std::{path::PathBuf, process::Command};
 
 fn main() {
+    // 发布版本以 Git 标签为准；没有 Git 信息时回退到 Cargo.toml 版本。
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
+    println!("cargo:rerun-if-changed=.git/refs/tags");
+    let version = git_version().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+    println!("cargo:rustc-env=EXCELOOKUP_VERSION={version}");
+
     // 只在 Windows 目标嵌入图标(交叉编译 target=x86_64-pc-windows-gnu 也适用)
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -55,5 +63,17 @@ fn main() {
     );
     // 资源变更时重跑
     println!("cargo:rerun-if-changed=assets/icon.ico");
-    println!("cargo:rerun-if-changed=build.rs");
+}
+
+fn git_version() -> Option<String> {
+    let output = Command::new("git")
+        .args(["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let tag = String::from_utf8(output.stdout).ok()?;
+    let version = tag.trim().strip_prefix('v')?;
+    (!version.is_empty()).then(|| version.to_owned())
 }
