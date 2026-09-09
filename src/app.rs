@@ -66,8 +66,9 @@ pub struct ExcelLookupApp {
     /// 当前工作流步骤:主工作区一次只展示一个步骤。
     step: WorkflowStep,
     join_type: JoinType,
-    left_key_col: usize,
-    right_key_col: usize,
+    /// None = 未选择(该侧表被替换/切换后需重新选择)
+    left_key_col: Option<usize>,
+    right_key_col: Option<usize>,
     right_pick_cols: Vec<usize>,
     /// UI 用的宽松匹配开关(数字/文本互认 + trim)
     normalize_keys: bool,
@@ -79,6 +80,8 @@ pub struct ExcelLookupApp {
     /// 延迟到帧末处理(避免借用冲突)
     pending_open: Option<(Side, PathBuf)>,
     pending_save: bool,
+    /// 对调 A/B 后帧末统一处理(重置键列/输出列/结果)
+    pending_swap: bool,
 }
 
 struct JoinOutcome {
@@ -146,8 +149,8 @@ impl Default for ExcelLookupApp {
             right: Source::default(),
             step: WorkflowStep::Sources,
             join_type: JoinType::Left,
-            left_key_col: 0,
-            right_key_col: 0,
+            left_key_col: None,
+            right_key_col: None,
             right_pick_cols: vec![],
             normalize_keys: true,
             bracket_fold: true,
@@ -155,6 +158,7 @@ impl Default for ExcelLookupApp {
             result_filter: String::new(),
             pending_open: None,
             pending_save: false,
+            pending_swap: false,
         }
     }
 }
@@ -212,7 +216,8 @@ impl ExcelLookupApp {
                 src.error = Some(format!("打开失败: {e}"));
             }
         }
-        self.clamp_defaults();
+        // 该侧表已整体替换:键列/输出列需重新选择
+        self.reset_side_on_source_change(side);
         self.result = None;
         self.result_filter.clear();
     }
@@ -227,7 +232,8 @@ impl ExcelLookupApp {
             return;
         }
         src.sheet_idx = idx;
-        self.clamp_defaults();
+        // 该侧表已切换:键列/输出列需重新选择
+        self.reset_side_on_source_change(side);
         self.result = None;
         self.result_filter.clear();
         if self.step == WorkflowStep::Result {
@@ -235,19 +241,16 @@ impl ExcelLookupApp {
         }
     }
 
-    fn clamp_defaults(&mut self) {
-        let lc = self.left.cur_col_count();
-        let rc = self.right.cur_col_count();
-        if lc > 0 && self.left_key_col >= lc {
-            self.left_key_col = 0;
-        }
-        if rc > 0 {
-            if self.right_key_col >= rc {
-                self.right_key_col = 0;
+    /// 某侧的表被替换/切换后调用:清空该侧键列选择(严格版:即使下标合法也不保留,避免
+    /// "下标合法但列含义已变"的静默错误),并清空该侧输出列(若为 B)。另一侧不受影响。
+    fn reset_side_on_source_change(&mut self, side: Side) {
+        match side {
+            Side::Left => {
+                self.left_key_col = None;
             }
-            self.right_pick_cols.retain(|&c| c < rc);
-            if self.right_pick_cols.is_empty() && rc > 1 {
-                self.right_pick_cols = vec![1];
+            Side::Right => {
+                self.right_key_col = None;
+                self.right_pick_cols.clear();
             }
         }
     }
@@ -291,8 +294,23 @@ impl ExcelLookupApp {
             self.step = WorkflowStep::Configure;
             return;
         }
-        let lk = self.left_key_col.min(lc.saturating_sub(1));
-        let rk = self.right_key_col.min(rc.saturating_sub(1));
+        // 键列未选择或当前表无列时不允许执行
+        let (Some(lk), Some(rk)) = (self.left_key_col, self.right_key_col) else {
+            self.result = Some(JoinOutcome {
+                table: Table::default(),
+                left_matched: 0,
+                left_total: 0,
+                right_matched_rows: 0,
+                right_total: 0,
+                out_rows: 0,
+                err: Some("请先在连接配置中选择 A/B 匹配列".into()),
+                join_type: self.join_type,
+            });
+            self.step = WorkflowStep::Configure;
+            return;
+        };
+        let lk = lk.min(lc.saturating_sub(1));
+        let rk = rk.min(rc.saturating_sub(1));
         let rp: Vec<usize> = self
             .right_pick_cols
             .iter()
@@ -352,8 +370,21 @@ impl ExcelLookupApp {
     fn clear_sources(&mut self) {
         self.left = Source::default();
         self.right = Source::default();
-        self.left_key_col = 0;
-        self.right_key_col = 0;
+        self.left_key_col = None;
+        self.right_key_col = None;
+        self.right_pick_cols.clear();
+        self.result = None;
+        self.result_filter.clear();
+        self.step = WorkflowStep::Sources;
+    }
+
+    /// 对调 A/B 两个数据源(文件+sheet+当前选中)。
+    /// 匹配列随对调交换(新 A 沿用原 B 的键列,新 B 沿用原 A 的):整表互换后列号有效性自动
+    /// 守恒,即便某侧此前未选择,交换后仍为 None。
+    /// 输出列清空——主从关系已变,带出字段需重新确认。
+    fn swap_sources(&mut self) {
+        std::mem::swap(&mut self.left, &mut self.right);
+        std::mem::swap(&mut self.left_key_col, &mut self.right_key_col);
         self.right_pick_cols.clear();
         self.result = None;
         self.result_filter.clear();
@@ -435,6 +466,10 @@ impl eframe::App for ExcelLookupApp {
         if self.pending_save {
             self.pending_save = false;
             self.export();
+        }
+        if self.pending_swap {
+            self.pending_swap = false;
+            self.swap_sources();
         }
     }
 }
@@ -1002,9 +1037,67 @@ impl ExcelLookupApp {
     }
 
     fn ui_sources_body(&mut self, ui: &mut egui::Ui) {
-        ui.columns(2, |cols| {
+        ui.columns(3, |cols| {
             self.ui_source_card(&mut cols[0], Side::Left);
-            self.ui_source_card(&mut cols[1], Side::Right);
+            // 中间列:对调 A/B 按钮(需要整列高度与两侧卡片对齐)
+            cols[1].vertical_centered(|ui| {
+                ui.add_space(8.0);
+                let size = egui::vec2(48.0, 48.0);
+                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                let button_rect = egui::Rect::from_center_size(rect.center(), size);
+                // 圆底 + 双箭头(⇄) + 悬停加深
+                let hovered = ui.rect_contains_pointer(button_rect);
+                let (bg, fg) = if hovered {
+                    (Self::blue_soft(), Self::blue())
+                } else {
+                    (Self::white(), Self::muted())
+                };
+                let painter = ui.painter();
+                painter.circle_filled(button_rect.center(), 24.0, bg);
+                painter.circle_stroke(button_rect.center(), 24.0, Stroke::new(1.0, Self::line_strong()));
+                let center = button_rect.center();
+                // 上箭头(右向)
+                let y1 = center.y - 9.0;
+                painter.line_segment(
+                    [egui::pos2(center.x - 8.0, y1), egui::pos2(center.x + 8.0, y1)],
+                    Stroke::new(2.0, fg),
+                );
+                painter.line_segment(
+                    [egui::pos2(center.x + 8.0, y1), egui::pos2(center.x + 3.0, y1 - 4.0)],
+                    Stroke::new(2.0, fg),
+                );
+                painter.line_segment(
+                    [egui::pos2(center.x + 8.0, y1), egui::pos2(center.x + 3.0, y1 + 4.0)],
+                    Stroke::new(2.0, fg),
+                );
+                // 下箭头(左向)
+                let y2 = center.y + 9.0;
+                painter.line_segment(
+                    [egui::pos2(center.x - 8.0, y2), egui::pos2(center.x + 8.0, y2)],
+                    Stroke::new(2.0, fg),
+                );
+                painter.line_segment(
+                    [egui::pos2(center.x - 8.0, y2), egui::pos2(center.x - 3.0, y2 - 4.0)],
+                    Stroke::new(2.0, fg),
+                );
+                painter.line_segment(
+                    [egui::pos2(center.x - 8.0, y2), egui::pos2(center.x - 3.0, y2 + 4.0)],
+                    Stroke::new(2.0, fg),
+                );
+
+                let resp = ui.interact(button_rect, ui.id().with("swap_ab"), egui::Sense::click());
+                if resp.clicked() {
+                    self.pending_swap = true;
+                }
+                resp.on_hover_text("对调 A/B 表");
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("对调")
+                        .size(12.0)
+                        .color(if hovered { Self::blue() } else { Self::soft() }),
+                );
+            });
+            self.ui_source_card(&mut cols[2], Side::Right);
         });
 
         let can_next = self.sources_ready();
@@ -1231,6 +1324,8 @@ impl ExcelLookupApp {
                         );
                         ui.add_space(7.0);
                         Self::col_combo(ui, "workflow_b_key", &right_headers, &mut self.right_key_col);
+                        // 键列不允许作为输出列:改了键,同步从输出列中剔除
+                        self.right_pick_cols.retain(|&c| Some(c) != self.right_key_col);
                     });
                 });
             } else {
@@ -1254,6 +1349,8 @@ impl ExcelLookupApp {
                 ui.add_space(10.0);
                 ui.label(egui::RichText::new("B 匹配列").strong().color(Self::muted()));
                 Self::col_combo(ui, "workflow_b_key_small", &right_headers, &mut self.right_key_col);
+                // 键列不允许作为输出列:改了键,同步从输出列中剔除
+                self.right_pick_cols.retain(|&c| Some(c) != self.right_key_col);
             }
         });
 
@@ -1271,8 +1368,18 @@ impl ExcelLookupApp {
             });
             ui.add_space(10.0);
             ui.horizontal_wrapped(|ui| {
+                let right_key = self.right_key_col;
+                let mut key_unset = false;
+                if right_key.is_none() {
+                    key_unset = true;
+                    ui.label(
+                        egui::RichText::new("请先选择 B 匹配列，再勾选输出字段")
+                            .size(12.0)
+                            .color(Self::amber()),
+                    );
+                }
                 for (index, header) in right_headers.iter().enumerate() {
-                    if index == self.right_key_col {
+                    if key_unset || Some(index) == right_key {
                         continue;
                     }
                     let selected = self.right_pick_cols.contains(&index);
@@ -1284,7 +1391,7 @@ impl ExcelLookupApp {
                         }
                     }
                 }
-                if self.right_pick_cols.is_empty() {
+                if right_key.is_some() && self.right_pick_cols.is_empty() {
                     ui.label(
                         egui::RichText::new("未选择字段，结果将只有 A 的列")
                             .size(12.0)
@@ -1313,7 +1420,8 @@ impl ExcelLookupApp {
         });
 
         Self::action_row(ui, "配置会保留，可随时返回调整", |ui| {
-            if Self::primary_button(ui, "执行连接并查看结果  →", 180.0, true).clicked() {
+            let keys_ready = self.left_key_col.is_some() && self.right_key_col.is_some();
+            if Self::primary_button(ui, "执行连接并查看结果  →", 180.0, keys_ready).clicked() {
                 self.run_join();
             }
             if Self::secondary_button(ui, "上一步", 72.0).clicked() {
@@ -1336,18 +1444,18 @@ impl ExcelLookupApp {
         }
     }
 
-    fn col_combo(ui: &mut egui::Ui, id: &str, headers: &[String], sel: &mut usize) {
+    fn col_combo(ui: &mut egui::Ui, id: &str, headers: &[String], sel: &mut Option<usize>) {
         if headers.is_empty() {
             ui.add_enabled(false, egui::Button::new("—"));
             return;
         }
-        let selected = headers.get(*sel).cloned().unwrap_or_default();
+        let selected = sel.and_then(|i| headers.get(i)).cloned();
         egui::ComboBox::from_id_salt(id)
-            .selected_text(selected)
+            .selected_text(selected.unwrap_or_else(|| "(请选择匹配列)".to_owned()))
             .width(ui.available_width())
             .show_ui(ui, |ui| {
                 for (index, name) in headers.iter().enumerate() {
-                    ui.selectable_value(sel, index, name);
+                    ui.selectable_value(sel, Some(index), name);
                 }
             });
     }
