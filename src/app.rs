@@ -8,6 +8,17 @@ use egui_extras::{Column, TableBuilder};
 use excelookup_lib::join::{join, JoinSpec, JoinType, KeyMode};
 use excelookup_lib::model::{CellValue, Table};
 
+/// 后台加载线程回主线程的消息(数据 move,不 clone)
+struct LoadMsg {
+    side: Side,
+    /// 发起时的世代号:主线程据此丢弃过期(被新请求取代)的结果
+    generation: u64,
+    /// 文件路径(随回包带回,供主线程写入 Source.path)
+    path: PathBuf,
+    /// 成功 = (sheet名, Table) 列表;失败 = 错误文案
+    result: std::result::Result<Vec<(String, Table)>, String>,
+}
+
 /// 一个已打开的数据源(文件 + sheets)
 #[derive(Default, Clone)]
 struct Source {
@@ -77,8 +88,14 @@ pub struct ExcelLookupApp {
     result: Option<JoinOutcome>,
     /// 结果表行筛选状态(点击指标卡片切换;None=全部)
     row_filter: Option<RowFilter>,
-    /// 延迟到帧末处理(避免借用冲突)
-    pending_open: Option<(Side, PathBuf)>,
+    /// 后台加载通道收端(每帧 poll,取到即应用)
+    load_rx: Option<std::sync::mpsc::Receiver<LoadMsg>>,
+    /// 发端 clone 给每次 spawn 的后台线程(单收端收两侧结果)
+    load_tx: Option<std::sync::mpsc::Sender<LoadMsg>>,
+    /// 每侧加载请求世代号:发起 +1,回包 gen 不匹配则丢弃(旧请求晚到)
+    load_gen: [u64; 2],
+    /// 每侧是否正在后台加载
+    load_active: [bool; 2],
     pending_save: bool,
     /// 对调 A/B 后帧末统一处理(重置键列/输出列/结果)
     pending_swap: bool,
@@ -110,6 +127,15 @@ struct JoinOutcome {
 enum Side {
     Left,
     Right,
+}
+
+impl Side {
+    fn index(self) -> usize {
+        match self {
+            Self::Left => 0,
+            Self::Right => 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -167,7 +193,10 @@ impl Default for ExcelLookupApp {
             bracket_fold: true,
             result: None,
             row_filter: None,
-            pending_open: None,
+            load_rx: None,
+            load_tx: None,
+            load_gen: [0, 0],
+            load_active: [false, false],
             pending_save: false,
             pending_swap: false,
         }
@@ -188,26 +217,71 @@ impl ExcelLookupApp {
         }
     }
 
-    fn pick_and_load(&mut self, side: Side) {
+    fn pick_and_load(&mut self, side: Side, ui: &egui::Ui) {
         let picked = rfd::FileDialog::new()
             .add_filter("Excel 工作簿", &["xlsx", "xls", "xlsb", "xlsm", "ods"])
             .add_filter("所有文件", &["*"])
             .pick_file();
-        if let Some(p) = picked {
+        if let Some(path) = picked {
             self.step = WorkflowStep::Sources;
-            self.pending_open = Some((side, p));
+            self.start_load(side, path, ui.ctx().clone());
         }
     }
 
-    fn open_file(&mut self, side: Side, path: PathBuf) {
+    /// 启动后台加载:spawn 线程解析,主线程不阻塞;返回后界面立即可交互。
+    fn start_load(&mut self, side: Side, path: PathBuf, ctx: egui::Context) {
+        let idx = side.index();
+        // 旧请求结果作废:世代 +1;正在跑的旧线程结果回来时 gen 不匹配会被丢弃
+        self.load_gen[idx] += 1;
+        let generation = self.load_gen[idx];
+        self.load_active[idx] = true;
+        // 新加载开始:清掉旧错误(加载成功/失败后再按结果设置)
+        match side {
+            Side::Left => self.left.error = None,
+            Side::Right => self.right.error = None,
+        }
+
+        // 确保通道存在(首次创建)
+        if self.load_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<LoadMsg>();
+            self.load_rx = Some(rx);
+            self.load_tx = Some(tx);
+        }
+        let tx = self.load_tx.as_ref().expect("load_tx 已初始化").clone();
+        // 立即刷新一次 UI 显示"加载中…"(否则要等下次交互才重绘)
+        ctx.request_repaint();
+        // 线程只依赖 lib + repaint 句柄(不碰 GUI 状态),成功后整表 move 回主线程,不 clone。
+        // catch_unwind:即使解析 panic 也发回错误消息,避免 UI 永远停在"加载中"。
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| excelookup_lib::read_xlsx::read_workbook(&path))
+                .map_err(|_| "读取过程发生内部错误（已中止）".to_owned())
+                .and_then(|r| r.map_err(|e| format!("{e}")));
+            let _ = tx.send(LoadMsg { side, generation, path, result });
+            // 唤醒主线程处理结果(后台完成时 UI 可能空闲无重绘)
+            ctx.request_repaint();
+        });
+    }
+
+    /// 应用后台加载结果(主线程,帧末 poll 到后调用)。
+    /// 世代不匹配 = 已有更新的加载请求,丢弃旧结果。
+    fn apply_load_result(
+        &mut self,
+        side: Side,
+        generation: u64,
+        path: PathBuf,
+        result: Result<Vec<(String, Table)>, String>,
+    ) {
+        if generation != self.load_gen[side.index()] {
+            return; // 过期结果,丢弃
+        }
+        self.load_active[side.index()] = false;
         let src = match side {
             Side::Left => &mut self.left,
             Side::Right => &mut self.right,
         };
         src.error = None;
-        match excelookup_lib::read_xlsx::read_workbook(&path) {
+        match result {
             Ok(sheets) => {
-                // 至少保留一个(即使全空也存,便于用户切换看到空表)
                 if sheets.is_empty() {
                     src.error = Some("工作簿中无工作表".into());
                     return;
@@ -222,15 +296,15 @@ impl ExcelLookupApp {
                 if let Some(idx) = src.sheets.iter().position(|t| !t.is_empty()) {
                     src.sheet_idx = idx;
                 }
+                // 该侧表已整体替换:键列/输出列需重新选择
+                self.reset_side_on_source_change(side);
+                self.result = None;
+                self.row_filter = None;
             }
             Err(e) => {
                 src.error = Some(format!("打开失败: {e}"));
             }
         }
-        // 该侧表已整体替换:键列/输出列需重新选择
-        self.reset_side_on_source_change(side);
-        self.result = None;
-        self.row_filter = None;
     }
 
     /// 切换 sheet(切换后清结果、校正键列)
@@ -390,6 +464,10 @@ impl ExcelLookupApp {
         self.right_pick_cols.clear();
         self.result = None;
         self.row_filter = None;
+        // 作废所有在途加载请求(清空后旧结果不得落回)
+        self.load_gen[0] += 1;
+        self.load_gen[1] += 1;
+        self.load_active = [false, false];
         self.step = WorkflowStep::Sources;
     }
 
@@ -407,7 +485,9 @@ impl ExcelLookupApp {
     }
 
     fn sources_ready(&self) -> bool {
-        self.left.is_loaded()
+        !self.load_active[Side::Left.index()]
+            && !self.load_active[Side::Right.index()]
+            && self.left.is_loaded()
             && self.right.is_loaded()
             && self.left.error.is_none()
             && self.right.error.is_none()
@@ -474,9 +554,18 @@ impl eframe::App for ExcelLookupApp {
                     });
             });
 
-        // 帧末处理延迟事件
-        if let Some((side, path)) = self.pending_open.take() {
-            self.open_file(side, path);
+        // 帧末:poll 后台加载结果(非阻塞;可能同时有两侧/多个结果排队)
+        let msgs: Vec<LoadMsg> = if let Some(rx) = &self.load_rx {
+            let mut v = Vec::new();
+            while let Ok(msg) = rx.try_recv() {
+                v.push(msg);
+            }
+            v
+        } else {
+            Vec::new()
+        };
+        for msg in msgs {
+            self.apply_load_result(msg.side, msg.generation, msg.path, msg.result);
         }
         if self.pending_save {
             self.pending_save = false;
@@ -1077,11 +1166,24 @@ impl ExcelLookupApp {
                     Stroke::new(2.0, fg),
                 );
 
-                let resp = ui.interact(button_rect, ui.id().with("swap_ab"), egui::Sense::click());
-                if resp.clicked() {
+                let any_loading = self.load_active[0] || self.load_active[1];
+                let resp = ui.interact(
+                    button_rect,
+                    ui.id().with("swap_ab"),
+                    if any_loading {
+                        egui::Sense::hover()
+                    } else {
+                        egui::Sense::click()
+                    },
+                );
+                if !any_loading && resp.clicked() {
                     self.pending_swap = true;
                 }
-                resp.on_hover_text("对调 A/B 表");
+                if any_loading {
+                    resp.on_hover_text("加载完成后再对调");
+                } else {
+                    resp.on_hover_text("对调 A/B 表");
+                }
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new("对调")
@@ -1104,6 +1206,7 @@ impl ExcelLookupApp {
     }
 
     fn ui_source_card(&mut self, ui: &mut egui::Ui, side: Side) {
+        let loading = self.load_active[side.index()];
         let (loaded, label, rows, cols, sheet_names, sheet_idx, error) = {
             let src = match side {
                 Side::Left => &self.left,
@@ -1147,33 +1250,50 @@ impl ExcelLookupApp {
                     });
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if loaded && error.is_none() {
+                    if loading {
+                        Self::status_badge(ui, "加载中…");
+                    } else if loaded && error.is_none() {
                         Self::status_badge(ui, "已加载");
                     }
                 });
             });
             ui.add_space(19.0);
 
-            let file_label = if loaded {
+            let file_label = if loading {
+                "正在后台读取…".to_owned()
+            } else if loaded {
                 format!("▣  {label}")
             } else {
                 "选择工作簿".to_owned()
             };
             let button_width = ui.available_width();
-            if ui
-                .add_sized(
-                    [button_width, 39.0],
-                    egui::Button::new(egui::RichText::new(file_label).strong().color(Self::ink()))
+            ui.add_enabled_ui(!loading, |ui| {
+                if ui
+                    .add_sized(
+                        [button_width, 39.0],
+                        egui::Button::new(
+                            egui::RichText::new(file_label).strong().color(Self::ink()),
+                        )
                         .fill(Self::white())
                         .stroke(Stroke::new(1.0, Self::line_strong()))
-                .corner_radius(CornerRadius::ZERO),
-                )
-                .clicked()
-            {
-                self.pick_and_load(side);
+                        .corner_radius(CornerRadius::ZERO),
+                    )
+                    .clicked()
+                {
+                    self.pick_and_load(side, ui);
+                }
+            });
+
+            if loading {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("大文件解析中,界面保持可操作")
+                        .size(12.0)
+                        .color(Self::muted()),
+                );
             }
 
-            if loaded {
+            if loaded && !loading {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(format!("工作簿 · {rows} 行 · {cols} 列"))
@@ -1218,7 +1338,7 @@ impl ExcelLookupApp {
                     .size(12.0)
                     .color(Self::teal()),
                 );
-            } else {
+            } else if !loading {
                 ui.add_space(10.0);
                 ui.label(
                     egui::RichText::new("选择一个工作簿后，可在这里切换工作表")
@@ -1228,8 +1348,10 @@ impl ExcelLookupApp {
             }
 
             if let Some(error) = &error {
-                ui.add_space(8.0);
-                ui.colored_label(Self::amber(), format!("⚠ {error}"));
+                if !loading {
+                    ui.add_space(8.0);
+                    ui.colored_label(Self::amber(), format!("⚠ {error}"));
+                }
             }
         });
     }
@@ -1733,70 +1855,88 @@ impl ExcelLookupApp {
         let text_h = ui.text_style_height(&egui::TextStyle::Body);
         let row_h = (text_h + 7.0).max(22.0);
         let sep_color = Self::line();
-        // 预览表允许拖拽列宽（表头分隔线），便于展开长文本列；
-        // 命中区仅在表头细线处，代价可忽略。
-        let mut builder = TableBuilder::new(ui)
-            .striped(true)
-            .resizable(true)
-            // 必须有 click/drag 位才有真正 hover 感应（egui 0.36 Sense::hover() 为空）；
-            // 行内格子 hover 后由 egui_extras 自动整行高亮（用于长行横向对位）。
-            .sense(egui::Sense::click())
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .vscroll(true)
-            .max_scroll_height(300.0);
-        if ncols >= 2 {
-            builder = builder
-                .columns(Column::auto().at_least(70.0).clip(true), ncols - 1)
-                .column(Column::remainder().at_least(80.0).clip(true));
-        } else {
-            builder = builder.columns(Column::remainder().at_least(80.0).clip(true), ncols);
-        }
-
-        builder
-            .header(row_h, |mut header| {
-                for name in &headers {
-                    header.col(|ui| {
-                        ui.label(egui::RichText::new(name).size(13.0).strong().color(Self::muted()));
-                    });
+        // 横向滚动容器:表格总宽超过视口时可左右滚动查看所有列;
+        // Table 内部仍是纵向虚拟滚动(只渲染可见行),性能不受影响。
+        egui::ScrollArea::horizontal()
+            .id_salt("result_table_hscroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                // 每个数据列:initial(初始宽按内容舒适值,可拖拽调宽,文本截断)
+                // 相比 auto:auto 会在空间不足时缩到 70;initial 保持稳定宽度,
+                // 列数多时通过外层横滚访问,不会被压扁。
+                let col_initial = |i: usize| {
+                    let name_w = headers[i].chars().count() as f32 * 14.0 + 20.0;
+                    name_w.clamp(90.0, 260.0)
+                };
+                let mut builder = TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .sense(egui::Sense::click())
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .vscroll(true)
+                    .max_scroll_height(300.0);
+                for i in 0..ncols {
+                    let w = col_initial(i);
+                    builder = builder.column(Column::initial(w).at_least(70.0).clip(true));
                 }
-            })
-            .body(|body| {
-                body.rows(row_h, row_count, |mut row| {
-                    let index = visible_rows
-                        .as_ref()
-                        .map(|rows| rows[row.index()])
-                        .unwrap_or(row.index());
-                    for column in 0..ncols {
-                        row.col(|ui| {
-                            match table.cell(index, column) {
-                                None | Some(CellValue::Empty) => {
-                                    ui.label(egui::RichText::new("—").size(13.0).color(Self::soft()));
-                                }
-                                Some(value) => {
-                                    ui.label(
-                                        egui::RichText::new(value.display())
-                                            .size(13.0)
-                                            .color(Self::ink()),
-                                    );
-                                }
-                            }
-                            let rect = ui.max_rect();
-                            let painter = ui.painter();
-                            painter.hline(
-                                rect.x_range(),
-                                rect.bottom(),
-                                Stroke::new(1.0, sep_color),
-                            );
-                            if column < ncols - 1 {
-                                painter.vline(
-                                    rect.right(),
-                                    rect.y_range(),
-                                    Stroke::new(1.0, sep_color),
+
+                builder
+                    .header(row_h, |mut header| {
+                        for name in &headers {
+                            header.col(|ui| {
+                                ui.label(
+                                    egui::RichText::new(name)
+                                        .size(13.0)
+                                        .strong()
+                                        .color(Self::muted()),
                                 );
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        body.rows(row_h, row_count, |mut row| {
+                            let index = visible_rows
+                                .as_ref()
+                                .map(|rows| rows[row.index()])
+                                .unwrap_or(row.index());
+                            for column in 0..ncols {
+                                row.col(|ui| {
+                                    // 列 clip 时单元格 wrap_mode=Truncate,Label 默认在文本
+                                    // 被截断(elided)时自动弹全文 tooltip,无需手动添加。
+                                    match table.cell(index, column) {
+                                        None | Some(CellValue::Empty) => {
+                                            ui.label(
+                                                egui::RichText::new("—")
+                                                    .size(13.0)
+                                                    .color(Self::soft()),
+                                            );
+                                        }
+                                        Some(value) => {
+                                            ui.label(
+                                                egui::RichText::new(value.display())
+                                                    .size(13.0)
+                                                    .color(Self::ink()),
+                                            );
+                                        }
+                                    }
+                                    let rect = ui.max_rect();
+                                    let painter = ui.painter();
+                                    painter.hline(
+                                        rect.x_range(),
+                                        rect.bottom(),
+                                        Stroke::new(1.0, sep_color),
+                                    );
+                                    if column < ncols - 1 {
+                                        painter.vline(
+                                            rect.right(),
+                                            rect.y_range(),
+                                            Stroke::new(1.0, sep_color),
+                                        );
+                                    }
+                                });
                             }
                         });
-                    }
-                });
+                    });
             });
 
         ui.add_space(8.0);
@@ -1808,7 +1948,7 @@ impl ExcelLookupApp {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    egui::RichText::new("大数据表已启用虚拟滚动")
+                    egui::RichText::new("列宽可拖拽 · 横向可滚动")
                         .size(12.0)
                         .color(Self::soft()),
                 );
