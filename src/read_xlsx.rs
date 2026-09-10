@@ -15,12 +15,12 @@ use crate::model::{CellValue, Table};
 pub const PREVIEW_ROWS: usize = 8;
 
 /// 读取选项
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadOptions {
-    /// 列名行:已用区域内 0-based 行号(0 = 已用区域首行)。
-    /// `None` = 自动(取首个非空行)。
-    /// 指定行越界、或整行全空时回退为自动——避免切换工作表后行号失效把整表读废。
-    pub header_row: Option<usize>,
+    /// 各工作表的列名行:按工作表出现顺序,元素为已用区域内 0-based 行号。
+    /// 缺项(下表越界)或元素为 `None` = 自动(取该表首个非空行)。
+    /// 指定行越界、或整行全空时也会回退为自动——避免工作表行数不同时把整表读废。
+    pub header_rows: Vec<Option<usize>>,
     /// 是否回传顶部原始行预览(供 UI 展示/选择列名行)
     pub preview: bool,
 }
@@ -52,7 +52,7 @@ pub fn read_workbook(path: &Path) -> Result<Vec<(String, Table)>> {
         .collect())
 }
 
-/// 读取一个工作簿的全部 sheets,带读取选项(列名行可指定)。
+/// 读取一个工作簿的全部 sheets,带读取选项(列名行可按工作表指定)。
 pub fn read_workbook_opts(path: &Path, opts: ReadOptions) -> Result<Vec<SheetTable>> {
     let mut workbook = open_workbook_auto(path)
         .with_context(|| format!("无法打开文件: {}", path.display()))?;
@@ -63,11 +63,13 @@ pub fn read_workbook_opts(path: &Path, opts: ReadOptions) -> Result<Vec<SheetTab
     }
 
     let mut out = Vec::with_capacity(names.len());
-    for name in &names {
+    for (index, name) in names.iter().enumerate() {
         let mut range = workbook
             .worksheet_range(name)
             .with_context(|| format!("读取工作表「{}」失败", name))?;
-        let mut sheet = table_from_range(&mut range, opts);
+        // 该表指定的列名行(未指定 = 自动)
+        let requested = opts.header_rows.get(index).copied().flatten();
+        let mut sheet = table_from_range(&mut range, requested, opts.preview);
         sheet.name = name.clone();
         out.push(sheet);
     }
@@ -89,13 +91,17 @@ fn data_display(d: &Data) -> String {
 }
 
 /// 把 calamine Range<Data> 转成 [`SheetTable`]:
-/// 1. 定位列名行:指定行有效则用它,否则取首个非空行(前导空行丢弃)
+/// 1. 定位列名行:`requested` 有效则用它,否则取首个非空行(前导空行丢弃)
 /// 2. 列名若出现空列,自动命名 `列{n}`;重名加序号去重
 /// 3. 列名行之后逐行转换;整行全空则丢弃
 ///
 /// 优化:不建中间 Vec<Vec<&Data>> 引用矩阵;利用可变索引逐行 mem::take
 /// 移动 String 等数据,避免 30 万行级别下每个文本格的 clone。
-fn table_from_range(range: &mut calamine::Range<Data>, opts: ReadOptions) -> SheetTable {
+fn table_from_range(
+    range: &mut calamine::Range<Data>,
+    requested: Option<usize>,
+    preview_wanted: bool,
+) -> SheetTable {
     let width = range.width();
     let height = range.height();
     if width == 0 || height == 0 {
@@ -103,7 +109,7 @@ fn table_from_range(range: &mut calamine::Range<Data>, opts: ReadOptions) -> She
     }
 
     // 0. 顶部原始行预览(仅前 PREVIEW_ROWS 行,数据移动前先取文本)
-    let preview: Vec<Vec<String>> = if opts.preview {
+    let preview: Vec<Vec<String>> = if preview_wanted {
         (0..height.min(PREVIEW_ROWS))
             .map(|ri| range[ri].iter().map(data_display).collect())
             .collect()
@@ -113,7 +119,7 @@ fn table_from_range(range: &mut calamine::Range<Data>, opts: ReadOptions) -> She
 
     // 1. 定位列名行:指定行越界或整行全空 → 回退自动
     let auto = first_non_empty_row(range, height);
-    let header_idx = match opts.header_row {
+    let header_idx = match requested {
         Some(k) if k < height && range[k].iter().any(|c| !matches!(c, Data::Empty)) => Some(k),
         _ => auto,
     };
@@ -221,7 +227,7 @@ mod tests {
     /// 自动列名行、不要预览。
     /// 注意:读表对 Range 是移动语义(mem::take),每次调用都重新构造 Range。
     fn auto(nrows: usize, ncols: usize, cells: &[((usize, usize), Data)]) -> SheetTable {
-        table_from_range(&mut make_range(nrows, ncols, cells), ReadOptions::default())
+        table_from_range(&mut make_range(nrows, ncols, cells), None, false)
     }
 
     /// 指定列名行(已用区域 0-based),带回顶部预览
@@ -231,13 +237,7 @@ mod tests {
         cells: &[((usize, usize), Data)],
         row: usize,
     ) -> SheetTable {
-        table_from_range(
-            &mut make_range(nrows, ncols, cells),
-            ReadOptions {
-                header_row: Some(row),
-                preview: true,
-            },
-        )
+        table_from_range(&mut make_range(nrows, ncols, cells), Some(row), true)
     }
 
     #[test]
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn table_from_range_all_empty() {
         let mut r = calamine::Range::<Data>::empty();
-        let t = table_from_range(&mut r, ReadOptions::default());
+        let t = table_from_range(&mut r, None, false);
         assert!(t.table.is_empty());
         assert_eq!(t.auto_header_row, None);
     }

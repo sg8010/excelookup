@@ -7,7 +7,7 @@ use rust_xlsxwriter::Workbook;
 use excelookup_lib::export::write_xlsx;
 use excelookup_lib::join::{join, JoinSpec, JoinType, KeyMode};
 use excelookup_lib::model::CellValue;
-use excelookup_lib::read_xlsx::read_workbook;
+use excelookup_lib::read_xlsx::{read_workbook, read_workbook_opts, ReadOptions};
 
 /// 生成一个临时 xlsx:两个 sheet,left 与 right
 fn make_wb(path: &PathBuf) {
@@ -202,8 +202,6 @@ fn end_to_end_same_file_two_sheets() {
 /// 首行是合并单元格大标题、第二行才是列名:指定列名行后应跳过标题行
 #[test]
 fn end_to_end_header_row_skips_merged_title() {
-    use excelookup_lib::read_xlsx::{read_workbook_opts, ReadOptions};
-
     let path = std::env::temp_dir().join("exlook_it_title.xlsx");
     {
         let mut wb = Workbook::new();
@@ -229,7 +227,7 @@ fn end_to_end_header_row_skips_merged_title() {
 
     // 指定第 2 行(0-based 1)作列名 → 大标题行不参与连接
     let opts = ReadOptions {
-        header_row: Some(1),
+        header_rows: vec![Some(1)],
         preview: true,
     };
     let sheets = read_workbook_opts(&path, opts).unwrap();
@@ -259,6 +257,66 @@ fn end_to_end_header_row_skips_merged_title() {
     assert_eq!(res.table.headers, vec!["id", "名称", "金额", "金额"]);
     assert_eq!(res.table.row_count(), 3);
     assert_eq!(res.left_matched, 3);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 列名行按工作表各记一个:同一个工作簿里两个 sheet 结构不同,互不影响
+#[test]
+fn end_to_end_header_rows_are_per_sheet() {
+    let path = std::env::temp_dir().join("exlook_it_per_sheet.xlsx");
+    {
+        let mut wb = Workbook::new();
+        // sheet1:首行合并大标题,列名在第 2 行
+        {
+            let s = wb.add_worksheet();
+            s.set_name("带标题").unwrap();
+            s.merge_range(0, 0, 0, 1, "汇总", &rust_xlsxwriter::Format::new())
+                .unwrap();
+            s.write_string(1, 0, "id").unwrap();
+            s.write_string(1, 1, "名称").unwrap();
+            s.write_string(2, 0, "1").unwrap();
+            s.write_string(2, 1, "甲").unwrap();
+        }
+        // sheet2:首行就是列名
+        {
+            let s = wb.add_worksheet();
+            s.set_name("朴素").unwrap();
+            s.write_string(0, 0, "id").unwrap();
+            s.write_string(0, 1, "城市").unwrap();
+            s.write_string(1, 0, "1").unwrap();
+            s.write_string(1, 1, "北京").unwrap();
+        }
+        wb.save(&path).unwrap();
+    }
+
+    // 只给第 1 个 sheet 指定列名行;第 2 个 sheet 自动
+    let opts = ReadOptions {
+        header_rows: vec![Some(1)],
+        preview: true,
+    };
+    let sheets = read_workbook_opts(&path, opts).unwrap();
+    assert_eq!(sheets.len(), 2);
+
+    assert_eq!(sheets[0].name, "带标题");
+    assert_eq!(sheets[0].table.headers, vec!["id", "名称"]);
+    assert_eq!(sheets[0].table.row_count(), 1);
+    assert_eq!(sheets[0].used_header_row, Some(1));
+
+    assert_eq!(sheets[1].name, "朴素");
+    assert_eq!(sheets[1].table.headers, vec!["id", "城市"]); // 未被第 1 个 sheet 的选择带偏
+    assert_eq!(sheets[1].table.row_count(), 1);
+    assert_eq!(sheets[1].used_header_row, Some(0));
+
+    // 反向:给第 2 个 sheet 指定一个它没有的行 → 只有它回退(第 1 个不受影响)
+    let opts = ReadOptions {
+        header_rows: vec![Some(1), Some(7)],
+        preview: true,
+    };
+    let sheets = read_workbook_opts(&path, opts).unwrap();
+    assert_eq!(sheets[0].used_header_row, Some(1));
+    assert_eq!(sheets[1].used_header_row, Some(0));
+    assert_eq!(sheets[1].table.headers, vec!["id", "城市"]);
 
     let _ = std::fs::remove_file(&path);
 }
