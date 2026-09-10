@@ -7,6 +7,7 @@ use egui_extras::{Column, TableBuilder};
 
 use excelookup_lib::join::{join_with_limit, JoinSpec, JoinType, KeyMode};
 use excelookup_lib::model::{CellValue, Table};
+use excelookup_lib::read_xlsx::{ReadOptions, SheetTable};
 
 #[cfg(target_os = "linux")]
 use crate::file_dialog::{self, DialogAction, FileDialog};
@@ -18,20 +19,22 @@ struct LoadMsg {
     generation: u64,
     /// 文件路径(随回包带回,供主线程写入 Source.path)
     path: PathBuf,
-    /// 成功 = (sheet名, Table) 列表;失败 = 错误文案
-    result: std::result::Result<Vec<(String, Table)>, String>,
+    /// 本次读取用的列名行(已用区域 0-based;None = 自动)
+    header_row: Option<usize>,
+    /// 成功 = 各工作表;失败 = 错误文案
+    result: std::result::Result<Vec<SheetTable>, String>,
 }
 
 /// 一个已打开的数据源(文件 + sheets)
 #[derive(Default, Clone)]
 struct Source {
     path: Option<PathBuf>,
-    /// 所有 sheet 名(工作簿顺序)
-    sheet_names: Vec<String>,
-    /// 所有 sheet 数据(与 sheet_names 对齐)
-    sheets: Vec<Table>,
+    /// 所有工作表(名称 / 数据表 / 顶部预览),顺序与工作簿一致
+    sheets: Vec<SheetTable>,
     /// 当前 sheet 下标
     sheet_idx: usize,
+    /// 列名行选择:已用区域 0-based;None = 自动(取首个非空行)
+    header_row: Option<usize>,
     error: Option<String>,
 }
 
@@ -48,15 +51,20 @@ impl Source {
             .unwrap_or_default()
     }
 
+    fn sheet_names(&self) -> Vec<String> {
+        self.sheets.iter().map(|s| s.name.clone()).collect()
+    }
+
+    fn cur_sheet(&self) -> Option<&SheetTable> {
+        self.sheets.get(self.sheet_idx)
+    }
+
     fn cur_sheet_name(&self) -> &str {
-        self.sheet_names
-            .get(self.sheet_idx)
-            .map(|s| s.as_str())
-            .unwrap_or("")
+        self.cur_sheet().map(|s| s.name.as_str()).unwrap_or("")
     }
 
     fn cur_table(&self) -> Option<&Table> {
-        self.sheets.get(self.sheet_idx)
+        self.cur_sheet().map(|s| &s.table)
     }
 
     fn cur_col_count(&self) -> usize {
@@ -308,7 +316,7 @@ impl ExcelLookupApp {
                 match request {
                     DialogRequest::Open(side) => {
                         self.step = WorkflowStep::Sources;
-                        self.start_load(side, path, ctx.clone());
+                        self.start_load(side, path, None, ctx.clone());
                     }
                     DialogRequest::Save => self.export_to(path),
                 }
@@ -330,7 +338,7 @@ impl ExcelLookupApp {
                     .pick_file();
                 if let Some(path) = picked {
                     self.step = WorkflowStep::Sources;
-                    self.start_load(side, path, ctx.clone());
+                    self.start_load(side, path, None, ctx.clone());
                 }
             }
             DialogRequest::Save => {
@@ -346,7 +354,8 @@ impl ExcelLookupApp {
     }
 
     /// 启动后台加载:spawn 线程解析,主线程不阻塞;返回后界面立即可交互。
-    fn start_load(&mut self, side: Side, path: PathBuf, ctx: egui::Context) {
+    /// `header_row` = 用哪一行作列名行(已用区域 0-based;None = 自动)。
+    fn start_load(&mut self, side: Side, path: PathBuf, header_row: Option<usize>, ctx: egui::Context) {
         let idx = side.index();
         // 旧请求结果作废:世代 +1;正在跑的旧线程结果回来时 gen 不匹配会被丢弃
         self.load_gen[idx] += 1;
@@ -370,10 +379,24 @@ impl ExcelLookupApp {
         // 线程只依赖 lib + repaint 句柄(不碰 GUI 状态),成功后整表 move 回主线程,不 clone。
         // catch_unwind:即使解析 panic 也发回错误消息,避免 UI 永远停在"加载中"。
         std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(|| excelookup_lib::read_xlsx::read_workbook(&path))
-                .map_err(|_| "读取过程发生内部错误（已中止）".to_owned())
-                .and_then(|r| r.map_err(|e| format!("{e}")));
-            let _ = tx.send(LoadMsg { side, generation, path, result });
+            let result = std::panic::catch_unwind(|| {
+                excelookup_lib::read_xlsx::read_workbook_opts(
+                    &path,
+                    ReadOptions {
+                        header_row,
+                        preview: true,
+                    },
+                )
+            })
+            .map_err(|_| "读取过程发生内部错误（已中止）".to_owned())
+            .and_then(|r| r.map_err(|e| format!("{e}")));
+            let _ = tx.send(LoadMsg {
+                side,
+                generation,
+                path,
+                header_row,
+                result,
+            });
             // 唤醒主线程处理结果(后台完成时 UI 可能空闲无重绘)
             ctx.request_repaint();
         });
@@ -386,7 +409,8 @@ impl ExcelLookupApp {
         side: Side,
         generation: u64,
         path: PathBuf,
-        result: Result<Vec<(String, Table)>, String>,
+        header_row: Option<usize>,
+        result: Result<Vec<SheetTable>, String>,
     ) {
         if generation != self.load_gen[side.index()] {
             return; // 过期结果,丢弃
@@ -403,20 +427,30 @@ impl ExcelLookupApp {
                     src.error = Some("工作簿中无工作表".into());
                     return;
                 }
-                let names: Vec<String> = sheets.iter().map(|(n, _)| n.clone()).collect();
-                let tables: Vec<Table> = sheets.into_iter().map(|(_, t)| t).collect();
+                // 同一文件 + 同一列名行(即换列名行触发的重读)时保留当前工作表与列选择
+                let same_workbook = src.path.as_deref() == Some(path.as_path());
+                let same_header = src.header_row == header_row;
+                let keep_sheet = same_workbook && same_header;
+                let prev_sheet_idx = src.sheet_idx;
                 src.path = Some(path);
-                src.sheet_names = names;
-                src.sheets = tables;
-                src.sheet_idx = 0;
-                // 跳到第一个非空 sheet
-                if let Some(idx) = src.sheets.iter().position(|t| !t.is_empty()) {
-                    src.sheet_idx = idx;
+                src.sheets = sheets;
+                src.header_row = header_row;
+                if keep_sheet && prev_sheet_idx < src.sheets.len() {
+                    src.sheet_idx = prev_sheet_idx;
+                } else {
+                    // 跳到第一个非空 sheet
+                    src.sheet_idx = src
+                        .sheets
+                        .iter()
+                        .position(|s| !s.table.is_empty())
+                        .unwrap_or(0);
                 }
-                // 该侧表已整体替换:键列/输出列需重新选择
-                self.reset_side_on_source_change(side);
-                self.result = None;
-                self.row_filter = None;
+                if !keep_sheet {
+                    // 换表/换列名行 = 列含义已变:键列/输出列需重选
+                    self.reset_side_on_source_change(side);
+                    self.result = None;
+                    self.row_filter = None;
+                }
             }
             Err(e) => {
                 src.error = Some(format!("打开失败: {e}"));
@@ -790,7 +824,7 @@ impl eframe::App for ExcelLookupApp {
             Vec::new()
         };
         for msg in msgs {
-            self.apply_load_result(msg.side, msg.generation, msg.path, msg.result);
+            self.apply_load_result(msg.side, msg.generation, msg.path, msg.header_row, msg.result);
         }
         // 帧末:处理对话框(rfd 是阻塞调用,必须放在帧末;内置对话框也统一在这里画)
         self.drive_dialog(ui.ctx());
@@ -1437,7 +1471,7 @@ impl ExcelLookupApp {
                 src.label(),
                 src.cur_row_count(),
                 src.cur_col_count(),
-                src.sheet_names.clone(),
+                src.sheet_names(),
                 src.sheet_idx,
                 src.error.clone(),
             )
@@ -1542,6 +1576,8 @@ impl ExcelLookupApp {
                         );
                     }
                 });
+                ui.add_space(11.0);
+                self.ui_header_row_picker(ui, side);
                 ui.add_space(13.0);
                 ui.label(
                     egui::RichText::new(match side {
@@ -1567,6 +1603,105 @@ impl ExcelLookupApp {
                 }
             }
         });
+    }
+
+    /// 列名行选择器:首行是合并大标题 / 多行表头时,把列名行指到真正的列名那一行。
+    /// 改变即用同一文件重新读取(后台线程,界面不阻塞)。
+    fn ui_header_row_picker(&mut self, ui: &mut egui::Ui, side: Side) {
+        let (options, current, fell_back) = {
+            let src = match side {
+                Side::Left => &self.left,
+                Side::Right => &self.right,
+            };
+            let Some(sheet) = src.cur_sheet() else { return };
+            (
+                Self::header_row_options(
+                    &sheet.preview,
+                    sheet.first_row_number,
+                    sheet.auto_header_row,
+                    src.header_row,
+                ),
+                src.header_row,
+                src.header_row != sheet.used_header_row,
+            )
+        };
+        let mut picked = current;
+        let selected_text = options
+            .iter()
+            .find(|(value, _)| *value == current)
+            .map(|(_, label)| label.clone())
+            .unwrap_or_else(|| "自动".to_owned());
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("列名行").size(13.0).color(Self::soft()));
+            ui.add_space(8.0);
+            egui::ComboBox::from_id_salt(match side {
+                Side::Left => "workflow_left_header_row",
+                Side::Right => "workflow_right_header_row",
+            })
+            .selected_text(selected_text)
+            .width((ui.available_width() - 76.0).max(110.0))
+            .show_ui(ui, |ui| {
+                for (value, label) in &options {
+                    ui.selectable_value(&mut picked, *value, label);
+                }
+            });
+        });
+        if fell_back {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("⚠ 该工作表行数不足，已回退为自动识别列名行")
+                    .size(12.0)
+                    .color(Self::amber()),
+            );
+        }
+        if picked == current {
+            return;
+        }
+        let path = match side {
+            Side::Left => self.left.path.clone(),
+            Side::Right => self.right.path.clone(),
+        };
+        if let Some(path) = path {
+            self.start_load(side, path, picked, ui.ctx().clone());
+        }
+    }
+
+    /// 列名行候选:自动 + 顶部原始行(带内容预览)。
+    /// `first_row` = 已用区域首行的 Excel 行号(1-based);`current` 落在预览窗口外时也补一项。
+    fn header_row_options(
+        preview: &[Vec<String>],
+        first_row: usize,
+        auto_row: Option<usize>,
+        current: Option<usize>,
+    ) -> Vec<(Option<usize>, String)> {
+        let mut out = vec![(
+            None,
+            match auto_row {
+                Some(row) => format!("自动（第 {} 行）", first_row + row),
+                None => "自动".to_owned(),
+            },
+        )];
+        for (index, row) in preview.iter().enumerate() {
+            let text = row
+                .iter()
+                .map(|cell| cell.trim())
+                .filter(|cell| !cell.is_empty())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let text: String = text.chars().take(24).collect();
+            let text = if text.is_empty() {
+                "（空行）".to_owned()
+            } else {
+                text
+            };
+            out.push((Some(index), format!("第 {} 行：{}", first_row + index, text)));
+        }
+        if let Some(row) = current {
+            if !out.iter().any(|(value, _)| *value == Some(row)) {
+                out.push((Some(row), format!("第 {} 行", first_row + row)));
+            }
+        }
+        out
     }
 
     // ---------- 第二步:连接配置 ----------

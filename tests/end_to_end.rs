@@ -198,3 +198,67 @@ fn end_to_end_same_file_two_sheets() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// 首行是合并单元格大标题、第二行才是列名:指定列名行后应跳过标题行
+#[test]
+fn end_to_end_header_row_skips_merged_title() {
+    use excelookup_lib::read_xlsx::{read_workbook_opts, ReadOptions};
+
+    let path = std::env::temp_dir().join("exlook_it_title.xlsx");
+    {
+        let mut wb = Workbook::new();
+        let s = wb.add_worksheet();
+        s.set_name("销售").unwrap();
+        s.merge_range(0, 0, 0, 2, "2024 年销售统计", &rust_xlsxwriter::Format::new())
+            .unwrap();
+        for (i, h) in ["id", "名称", "金额"].iter().enumerate() {
+            s.write_string(1, i as u16, *h).unwrap();
+        }
+        for (r, (id, name, amount)) in
+            [(1001.0, "苹果", 12.5), (1002.0, "香蕉", 7.0), (1003.0, "橙子", 3.25)]
+                .iter()
+                .enumerate()
+        {
+            let row = (r + 2) as u32;
+            s.write_number(row, 0, *id).unwrap();
+            s.write_string(row, 1, *name).unwrap();
+            s.write_number(row, 2, *amount).unwrap();
+        }
+        wb.save(&path).unwrap();
+    }
+
+    // 指定第 2 行(0-based 1)作列名 → 大标题行不参与连接
+    let opts = ReadOptions {
+        header_row: Some(1),
+        preview: true,
+    };
+    let sheets = read_workbook_opts(&path, opts).unwrap();
+    assert_eq!(sheets.len(), 1);
+    let sheet = &sheets[0];
+    assert_eq!(sheet.name, "销售");
+    assert_eq!(sheet.table.headers, vec!["id", "名称", "金额"]);
+    assert_eq!(sheet.table.row_count(), 3);
+    assert_eq!(sheet.table.cell(0, 0), Some(&CellValue::Number(1001.0)));
+    assert_eq!(sheet.auto_header_row, Some(0)); // 自动会被标题行占掉
+    assert_eq!(sheet.used_header_row, Some(1));
+    assert_eq!(sheet.first_row_number, 1);
+    assert_eq!(sheet.preview[0][0], "2024 年销售统计");
+    assert_eq!(sheet.preview[1], vec!["id", "名称", "金额"]);
+
+    // 连接:带出"金额"列,行数不受标题行影响
+    let spec = JoinSpec {
+        left_keys: vec![0],
+        right_keys: vec![0],
+        right_pick: vec![2],
+        join_type: JoinType::Left,
+        key_mode: KeyMode::NORMALIZE,
+        expand_dup: true,
+    };
+    let right = sheet.table.clone();
+    let res = join(&sheet.table, &right, &spec);
+    assert_eq!(res.table.headers, vec!["id", "名称", "金额", "金额"]);
+    assert_eq!(res.table.row_count(), 3);
+    assert_eq!(res.left_matched, 3);
+
+    let _ = std::fs::remove_file(&path);
+}
