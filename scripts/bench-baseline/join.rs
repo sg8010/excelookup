@@ -3,7 +3,6 @@
 //! 左表按「原列」输出;右表只输出「取值列」,避免键列重复。
 //! 键支持多列复合;归一化可配置:数字/文本互认+trim、中文/英文括号互认。
 
-#[cfg(test)]
 use std::borrow::Cow;
 use std::collections::{HashMap, hash_map::Entry};
 use std::fmt::Write as _;
@@ -190,7 +189,7 @@ impl JoinIndex {
             let Some(key) = make_key(row, rk, mode) else {
                 continue;
             };
-            match rows.entry(key) {
+            match rows.entry(key.into_owned()) {
                 Entry::Vacant(slot) => {
                     slot.insert(RowMatches::One { row: i, count: 1 });
                     max_dup = max_dup.max(1);
@@ -228,53 +227,45 @@ impl JoinIndex {
 }
 
 /// 中文括号 → 对应英文括号(括号归一化)。没有可替换字符时直接借用原文。
-#[cfg(test)]
 fn fold_brackets(s: &str) -> Cow<'_, str> {
     if !s.chars().any(is_foldable_bracket) {
         return Cow::Borrowed(s);
     }
-    Cow::Owned(s.chars().map(|c| fold_bracket(c).unwrap_or(c)).collect())
+    Cow::Owned(
+        s.chars()
+            .map(|c| match c {
+                '（' => '(',
+                '）' => ')',
+                '【' => '[',
+                '】' => ']',
+                '｛' => '{',
+                '｝' => '}',
+                '〔' => '(',
+                '〕' => ')',
+                other => other,
+            })
+            .collect(),
+    )
 }
 
-fn fold_bracket(c: char) -> Option<char> {
-    match c {
-        '（' => Some('('),
-        '）' => Some(')'),
-        '【' => Some('['),
-        '】' => Some(']'),
-        '｛' => Some('{'),
-        '｝' => Some('}'),
-        '〔' => Some('('),
-        '〕' => Some(')'),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
 fn is_foldable_bracket(c: char) -> bool {
-    fold_bracket(c).is_some()
+    matches!(c, '（' | '）' | '【' | '】' | '｛' | '｝' | '〔' | '〕')
 }
 
-/// 把文本正文直接追加到目标 key。trim 只借用原字符串切片；括号归一化
-/// 发现替换时也直接写入目标缓冲区，不创建中间 String。
-fn append_folded_text(out: &mut String, text: &str) {
-    let mut segment_start = 0;
-    for (offset, c) in text.char_indices() {
-        let Some(folded) = fold_bracket(c) else {
-            continue;
-        };
-        out.push_str(&text[segment_start..offset]);
-        out.push(folded);
-        segment_start = offset + c.len_utf8();
+/// 文本正文归一化：trim 始终借用切片；括号没有发生替换时也借用。
+fn normalized_text(s: &str, mode: KeyMode) -> Cow<'_, str> {
+    let trimmed = if mode.number_text { s.trim() } else { s };
+    if mode.brackets {
+        fold_brackets(trimmed)
+    } else {
+        Cow::Borrowed(trimmed)
     }
-    out.push_str(&text[segment_start..]);
 }
 
 /// 向目标 key 追加一个带类型前缀的片段，返回该片段是否非空。
 ///
-/// 单列路径会直接调用这个函数，不经过 `Vec<String> + join`。正文 trim
-/// 借用切片，前缀仍使右表索引中的规范 key 必须拥有自己的字符串；A 表
-/// 则把它写进复用的 probe 缓冲区。
+/// 单列路径会直接调用这个函数，不经过 `Vec<String> + join`；前缀使规范
+/// key 必须拥有自己的字符串，这一点不能被 Cow 借用消除。
 fn append_key_part(out: &mut String, value: &CellValue, mode: KeyMode) -> bool {
     match value {
         CellValue::Empty => false,
@@ -289,60 +280,56 @@ fn append_key_part(out: &mut String, value: &CellValue, mode: KeyMode) -> bool {
             true
         }
         CellValue::Text(s) => {
-            let body = if mode.number_text { s.trim() } else { s };
+            let body = normalized_text(s, mode);
             let prefix = if mode.number_text { "V:" } else { "S:" };
             out.reserve(prefix.len() + body.len());
             out.push_str(prefix);
-            if mode.brackets {
-                append_folded_text(out, body);
-            } else {
-                out.push_str(body);
-            }
+            out.push_str(body.as_ref());
             true
         }
     }
 }
 
-/// 将一行规范化为 key。调用者拥有并复用 `key`，本函数在每行开始时清空
-/// 它；任何列越界或整键为空的失败路径也会清空，避免把上一行的内容带入
-/// 下一次 HashMap 查询。
-///
-/// 复合键仍使用历史 U+0001 分隔符且不转义；因此原有编码碰撞契约保持不变。
-fn write_key(row: &[CellValue], cols: &[usize], mode: KeyMode, key: &mut String) -> bool {
-    key.clear();
-    let valid = match cols {
-        [] => false,
-        [col] => row
-            .get(*col)
-            .is_some_and(|value| append_key_part(key, value, mode)),
-        _ => {
-            let mut any_non_empty = false;
-            let mut all_columns_present = true;
-            for (i, &col) in cols.iter().enumerate() {
-                let Some(value) = row.get(col) else {
-                    all_columns_present = false;
-                    break;
-                };
-                if i != 0 {
-                    key.push('\u{1}');
-                }
-                any_non_empty |= append_key_part(key, value, mode);
-            }
-            all_columns_present && any_non_empty
-        }
-    };
-    if !valid {
-        // 单列 Empty、全 Empty 复合键和部分写入后越界都必须留下空缓冲区。
-        key.clear();
+/// 单列 key 快速路径。非空文本/数字仍需为类型前缀创建一个规范 key，
+/// 但不再产生复合键用的中间 Vec 与 join 字符串。
+fn make_single_key<'a>(row: &'a [CellValue], col: usize, mode: KeyMode) -> Option<Cow<'a, str>> {
+    let value = row.get(col)?;
+    if matches!(value, CellValue::Empty) {
+        return None;
     }
-    valid
+    let mut key = String::new();
+    append_key_part(&mut key, value, mode);
+    Some(Cow::Owned(key))
 }
 
-/// 为右表索引生成拥有所有权的 key；A 表的预估/查询路径改用 `write_key`
-/// 复用单个缓冲区，避免逐行创建 String。
-fn make_key(row: &[CellValue], cols: &[usize], mode: KeyMode) -> Option<String> {
+/// 生成多列复合 key；空列跳过，整键为空返回 None。
+///
+/// 分隔符仍是历史约定的 U+0001，未做转义；因此包含该字符的复合键仍
+/// 存在编码碰撞风险，不能在本次性能优化中隐式改变匹配契约。
+fn make_composite_key<'a>(
+    row: &'a [CellValue],
+    cols: &[usize],
+    mode: KeyMode,
+) -> Option<Cow<'a, str>> {
     let mut key = String::new();
-    write_key(row, cols, mode, &mut key).then_some(key)
+    let mut any_non_empty = false;
+    for (i, &col) in cols.iter().enumerate() {
+        if i != 0 {
+            key.push('\u{1}');
+        }
+        let value = row.get(col)?;
+        any_non_empty |= append_key_part(&mut key, value, mode);
+    }
+    any_non_empty.then_some(Cow::Owned(key))
+}
+
+/// 生成 key；单列连接走无中间容器的快速路径。
+fn make_key<'a>(row: &'a [CellValue], cols: &[usize], mode: KeyMode) -> Option<Cow<'a, str>> {
+    match cols {
+        [] => None,
+        [col] => make_single_key(row, *col, mode),
+        _ => make_composite_key(row, cols, mode),
+    }
 }
 
 /// 预估连接输出行数与 B 侧重复键诊断。
@@ -360,25 +347,15 @@ pub fn estimate_join_rows(
     expand_dup: bool,
 ) -> JoinEstimate {
     let index = JoinIndex::build(right, rk, mode, expand_dup);
-    let mut key = String::new();
-    index.estimate(left, lk, join_type, &mut key)
+    index.estimate(left, lk, join_type)
 }
 
 impl JoinIndex {
-    fn estimate(
-        &self,
-        left: &Table,
-        lk: &[usize],
-        join_type: JoinType,
-        key: &mut String,
-    ) -> JoinEstimate {
+    fn estimate(&self, left: &Table, lk: &[usize], join_type: JoinType) -> JoinEstimate {
         let mut output_rows = 0usize;
         for row in &left.rows {
-            let matches = if write_key(row, lk, self.mode, key) {
-                self.lookup(key)
-            } else {
-                None
-            };
+            let key = make_key(row, lk, self.mode);
+            let matches = key.as_deref().and_then(|key| self.lookup(key));
             match matches {
                 Some(matches) => {
                     output_rows =
@@ -438,14 +415,11 @@ fn run_join(
         index: index_started.elapsed(),
         ..JoinTimings::default()
     };
-    // 预估与实际 probe 共用这一个 A 侧 key 缓冲区；write_key 每行开始和
-    // 失败时都会清空它，容量增长仍可能分配，但不会逐行新建 String。
-    let mut left_key = String::new();
 
     // 有上限时在同一 JoinIndex 上预估，超限直接返回，避免第二次重建 B 索引。
     let estimated_output = if let Some(limit) = max_output_rows {
         let preflight_started = Instant::now();
-        let estimate = index.estimate(left, &spec.left_keys, spec.join_type, &mut left_key);
+        let estimate = index.estimate(left, &spec.left_keys, spec.join_type);
         timings.preflight = preflight_started.elapsed();
         timings.estimate = Some(estimate);
         if estimate.output_rows > limit {
@@ -490,11 +464,8 @@ fn run_join(
     // ── 左表驱动(left / inner) ──
     for row in &left.rows {
         let probe_started = measure.then(Instant::now);
-        let hit = if write_key(row, &spec.left_keys, spec.key_mode, &mut left_key) {
-            index.lookup(&left_key)
-        } else {
-            None
-        };
+        let key = make_key(row, &spec.left_keys, spec.key_mode);
+        let hit = key.as_deref().and_then(|key| index.lookup(key));
         if let Some(probe_started) = probe_started {
             probe_time += probe_started.elapsed();
         }
@@ -590,7 +561,6 @@ pub fn join(left: &Table, right: &Table, spec: &JoinSpec) -> JoinResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::borrow::Cow;
 
     fn tbl(headers: &[&str], rows: &[&[&str]]) -> Table {
         let mut t = Table::new(headers.iter().map(|s| s.to_string()).collect());
@@ -926,48 +896,6 @@ mod tests {
         let normalized = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::NORMALIZE));
         // Text("") 与纯空白在 trim 后相同，但仍不与 Empty 相同。
         assert_eq!(normalized.row_hit, vec![false, true, true]);
-    }
-
-    #[test]
-    fn reused_key_buffer_clears_after_partial_write_and_empty_key() {
-        let row = vec![CellValue::Text("first".into())];
-        let mut key = String::from("stale-key");
-
-        // 第一列已经写入后，第二列越界；失败路径不能留下部分 key。
-        assert!(!write_key(&row, &[0, 1], KeyMode::EXACT, &mut key));
-        assert!(key.is_empty());
-
-        // 单列 Empty 和全 Empty 复合键也必须清空上一次内容。
-        assert!(!write_key(
-            &[CellValue::Empty],
-            &[0],
-            KeyMode::EXACT,
-            &mut key
-        ));
-        assert!(key.is_empty());
-        assert!(!write_key(
-            &[CellValue::Empty, CellValue::Empty],
-            &[0, 1],
-            KeyMode::EXACT,
-            &mut key
-        ));
-        assert!(key.is_empty());
-    }
-
-    #[test]
-    fn reused_key_buffer_handles_long_short_and_bracketed_keys() {
-        let mode = KeyMode {
-            number_text: true,
-            brackets: true,
-        };
-        let mut key = String::new();
-        let long = vec![CellValue::Text("  很长的键值（A）以及尾部  ".into())];
-        assert!(write_key(&long, &[0], mode, &mut key));
-        assert_eq!(key, "V:很长的键值(A)以及尾部");
-
-        let short = vec![CellValue::Text("x".into())];
-        assert!(write_key(&short, &[0], mode, &mut key));
-        assert_eq!(key, "V:x");
     }
 
     #[test]

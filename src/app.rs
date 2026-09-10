@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke};
 use egui_extras::{Column, TableBuilder};
 
-use excelookup_lib::join::{estimate_join_rows, join, JoinSpec, JoinType, KeyMode};
+use excelookup_lib::join::{join_with_limit, JoinSpec, JoinType, KeyMode};
 use excelookup_lib::model::{CellValue, Table};
 
 /// 后台加载线程回主线程的消息(数据 move,不 clone)
@@ -424,17 +424,27 @@ impl ExcelLookupApp {
             .filter(|&c| c < rc)
             .collect();
 
-        // 重复键展开防爆:预估展开后行数,超阈值直接报错阻止(避免千万行把 GUI/内存拖垮)
+        let spec = JoinSpec {
+            join_type: self.join_type,
+            left_keys: vec![lk],
+            right_keys: vec![rk],
+            right_pick: rp,
+            key_mode: self.key_mode(),
+            expand_dup: self.expand_dup,
+        };
+
+        // 重复键展开防爆:预估与真正 Join 共享同一个 B 索引；超限只返回诊断，
+        // 不再先统计一次再重新构建索引(避免大表重复扫描与重复 key 分配)。
         const MAX_EXPAND_ROWS: usize = 5_000_000;
-        if self.expand_dup {
-            let (est, max_dup, distinct) = estimate_join_rows(
-                left_t,
-                right_t,
-                &[lk],
-                &[rk],
-                self.key_mode(),
-            );
-            if est > MAX_EXPAND_ROWS {
+        let res = match join_with_limit(
+            left_t,
+            right_t,
+            &spec,
+            self.expand_dup.then_some(MAX_EXPAND_ROWS),
+        ) {
+            Ok(res) => res,
+            Err(limit) => {
+                let estimate = limit.estimate;
                 // 单位自适应:≥1 亿用亿,≥1 万用万,否则原样
                 let fmt = |n: usize| -> String {
                     if n >= 100_000_000 {
@@ -452,7 +462,7 @@ impl ExcelLookupApp {
                 let mut lines: Vec<String> = Vec::new();
                 lines.push(format!(
                     "重复键展开后结果约 {} 行,远超可处理范围,已中止。",
-                    fmt(est)
+                    fmt(estimate.output_rows)
                 ));
                 lines.push(String::new());
                 lines.push("【数据诊断】".into());
@@ -461,25 +471,28 @@ impl ExcelLookupApp {
                 ));
 
                 // 原因定位:先看 B 键重复度,再看单键极端值
-                if distinct > 0 && b_rows >= 10 && b_rows / distinct >= 10 {
+                if estimate.distinct_keys > 0
+                    && b_rows >= 10
+                    && b_rows / estimate.distinct_keys >= 10
+                {
                     lines.push(format!(
                         "· B 表键列几乎不唯一:{} 行只有 {} 个不同键值,单键最多重复 {} 次。",
                         fmt(b_rows),
-                        fmt(distinct),
-                        fmt(max_dup)
+                        fmt(estimate.distinct_keys),
+                        fmt(estimate.max_dup)
                     ));
                     lines.push("· 原因:匹配列很可能选成了“分类/枚举”类列(如省份、状态、类型),而非唯一编号列。".into());
-                } else if max_dup > 1000 {
+                } else if estimate.max_dup > 1000 {
                     lines.push(format!(
                         "· B 表键列存在单键重复 {} 次的极端值(去重后共 {} 个键)。",
-                        fmt(max_dup),
-                        fmt(distinct)
+                        fmt(estimate.max_dup),
+                        fmt(estimate.distinct_keys)
                     ));
                     lines.push("· 原因:B 表存在大量同键行,可能数据本身重复,或键列粒度过粗。".into());
                 } else {
                     lines.push(format!(
                         "· B 表键去重后 {} 个(共 {} 行),A 表 {a_rows} 行平均每键命中多条。",
-                        fmt(distinct),
+                        fmt(estimate.distinct_keys),
                         fmt(b_rows)
                     ));
                     lines.push("· 原因:A 与 B 的匹配列粒度不匹配(如明细对汇总),导致普遍一对多。".into());
@@ -509,17 +522,7 @@ impl ExcelLookupApp {
                 self.step = WorkflowStep::Result;
                 return;
             }
-        }
-
-        let spec = JoinSpec {
-            join_type: self.join_type,
-            left_keys: vec![lk],
-            right_keys: vec![rk],
-            right_pick: rp,
-            key_mode: self.key_mode(),
-            expand_dup: self.expand_dup,
         };
-        let res = join(left_t, right_t, &spec);
         let matched_rows = res.row_hit.iter().filter(|&&h| h).count();
         self.result = Some(JoinOutcome {
             table: res.table,
@@ -540,19 +543,28 @@ impl ExcelLookupApp {
     }
 
     fn export(&mut self) {
-        let Some(res) = &self.result else { return };
-        if res.err.is_some() || res.table.col_count() == 0 {
+        let can_export = self
+            .result
+            .as_ref()
+            .map(|res| res.err.is_none() && res.table.col_count() > 0)
+            .unwrap_or(false);
+        if !can_export {
             return;
         }
-        let table = res.table.clone();
         let picked = rfd::FileDialog::new()
             .add_filter("Excel 工作簿", &["xlsx"])
             .set_file_name("连接结果.xlsx")
             .save_file();
         if let Some(path) = picked {
-            if let Err(e) = excelookup_lib::export::write_xlsx(&table, &path) {
+            // 只借用结果表导出，避免在大结果集上再复制一整张 Table。
+            let error = self.result.as_ref().and_then(|res| {
+                excelookup_lib::export::write_xlsx(&res.table, &path)
+                    .err()
+                    .map(|e| format!("导出失败: {e}"))
+            });
+            if let Some(error) = error {
                 if let Some(r) = &mut self.result {
-                    r.err = Some(format!("导出失败: {e}"));
+                    r.err = Some(error);
                 }
             }
         }

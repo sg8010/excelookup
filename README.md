@@ -67,8 +67,22 @@ sudo apt install -y gcc-mingw-w64-x86-64
 ## 测试
 
 ```bash
-cargo test        # 16 个测试:join 引擎单测 + 真实 xlsx 端到端
+cargo test        # join 引擎单测 + 真实 xlsx 端到端
 ```
+
+Join 性能基准使用同一驱动直接编译原始基线和当前核心库（`rustc -O`），覆盖
+10 万、50 万、100 万行，唯一键、约 10% 重复、高重复、匹配率、文本长度、表宽、
+数字文本归一化、括号归一化、展开开关及超限拒绝。纯计时使用系统分配器，
+分配统计单独运行；每次采样独立进程。详细方法与结果见 [基准报告](docs/join-benchmark.md)。
+
+```bash
+./scripts/bench-join.sh
+# 或只跑一个场景（两版各三次计时、一次分配统计）：
+./scripts/bench-join.sh u100k_exact_narrow_100
+```
+两版分别来自 `scripts/bench-baseline/` 本轮基线快照和当前 `src/`；脚本不联网、
+不切换工作树，产物和原始日志写入运行时打印的临时目录。上一轮以
+`f6bd822` 为基线的完整采样仍见基准报告，基准不作为产品二进制参与默认构建。
 
 ## 技术栈
 
@@ -91,6 +105,8 @@ src/
 ├── read_xlsx.rs   # 工作簿读取(多 Sheet)
 ├── join.rs        # join 引擎(Left/Inner、复合键、宽松匹配)
 └── export.rs      # 导出 xlsx
+scripts/join_bench.rs # 两版共用的性能基准驱动
+scripts/bench-baseline/ # 本轮修改前的核心源码快照
 build.rs           # Windows 目标时把 assets/icon.ico 嵌入 exe(交叉编译也生效)
 assets/            # icon.png(窗口/任务栏图标)、icon.ico(exe 图标资源)
 tests/end_to_end.rs  # 真实文件端到端测试
