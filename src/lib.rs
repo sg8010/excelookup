@@ -3,6 +3,7 @@
 //! 独立于 GUI,便于单元测试与未来扩展(CLI 等)。
 
 pub mod export;
+pub mod filebrowser;
 pub mod join;
 pub mod model;
 pub mod read_xlsx;

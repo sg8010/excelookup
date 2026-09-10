@@ -20,6 +20,7 @@
 - **导出**:`.xlsx`(表头加粗、冻结首行、自适应列宽)
 - **格式支持**:读 `.xlsx / .xls / .xlsb / .ods`,导出 `.xlsx`
 - **中文界面**:Windows / Linux 均自动使用系统中文字体
+- **Linux 不依赖外部组件**:文件选择用内置对话框(egui 自绘),不需要 GTK / XDG Portal / zenity 这些精简桌面上常常缺失的东西
 
 ## 下载
 
@@ -46,6 +47,7 @@ chmod +x excelookup-linux-arm64
 
 - Rust stable(2024 edition)
 - Linux 桌面需系统自带 CJK 字体(Noto Sans CJK / 文泉驿等),Windows 用微软雅黑,均可自动识别
+- Linux 的文件对话框是内置的,不需要额外安装 GTK / XDG Desktop Portal / zenity
 
 ### Linux arm64 / x64
 
@@ -91,7 +93,7 @@ Join 性能基准使用同一驱动直接编译原始基线和当前核心库（
 | GUI | egui / eframe 0.36(即时模式,自带虚拟化表格) |
 | 读取 Excel | calamine(xlsx/xls/xlsb/ods) |
 | 写 Excel | rust_xlsxwriter |
-| 文件对话框 | rfd |
+| 文件对话框 | Linux:内置 egui 对话框;Windows:rfd(原生) |
 | 核心逻辑 | 独立 lib(`excelookup_lib`),与 GUI 解耦、可单测 |
 
 代码结构:
@@ -100,8 +102,10 @@ Join 性能基准使用同一驱动直接编译原始基线和当前核心库（
 src/
 ├── main.rs        # 二进制入口(GUI)
 ├── app.rs         # egui 界面:数据源卡片 / 连接配置 / 结果表
+├── file_dialog.rs # 内置文件对话框(Linux;不依赖 Portal / zenity)
 ├── lib.rs         # 库入口
 ├── model.rs       # 数据模型 CellValue / Table
+├── filebrowser.rs # 目录列举/排序/过滤等文件浏览纯逻辑(可单测)
 ├── read_xlsx.rs   # 工作簿读取(多 Sheet)
 ├── join.rs        # join 引擎(Left/Inner、复合键、宽松匹配)
 └── export.rs      # 导出 xlsx

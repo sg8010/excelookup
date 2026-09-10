@@ -4,13 +4,14 @@ ExcelLookup:Rust + egui/eframe 0.36 的 Excel 双表 Join GUI。交付 Linux arm
 
 ## 约定(代码看不出来)
 
-- **GUI 改动后的端到端验证由用户手动测试**,不要写程序自动截图/自动加载数据来验证 UI(徒增调试代码,绕远路)。core 逻辑(lib 层)仍需 cargo test
+- **GUI 改动后的端到端验证由用户手动测试**,不要写程序自动截图/自动加载数据来验证 UI(徒增调试代码,绕远路)。core 逻辑(lib 层)仍需 cargo test;内置文件对话框保留一个无头渲染冒烟测试(`file_dialog.rs::tests`,只防布局代码 panic,不验证外观)
 - **所有用户可见文案必须中文**(产品名、A/B、VLOOKUP 除外)
 - join/read/export 是纯逻辑 lib(`excelookup_lib`),**不得依赖 GUI**;新功能先 lib+单测再接 UI
 - `egui::FontData` 需包 `Arc`;egui 默认无 CJK → `app.rs::install_cjk_font()` 运行时加载系统字体,勿内嵌大字体
 - eframe 0.36 的 `App` trait 入口是 `fn ui(&mut self, ui: &mut egui::Ui, …)`(旧版 `update(&Context)` 已不存在)
-- rfd 文件对话框是阻塞的 → 用 `pending_open/pending_save` 延迟到帧末处理
-- 大数据表格用 `TableBuilder::body().rows()` 虚拟滚动,勿手写循环
+- **文件对话框**:Linux 用内置 egui 对话框(`src/file_dialog.rs` + lib 的 `filebrowser`),不用 rfd —— rfd 在 Linux 靠 XDG Portal,Portal 缺失会回退调 `zenity` 外部进程,精简桌面/无桌面目标机上直接没反应;Windows 仍用 rfd(原生 IFileDialog),依赖按 target 区隔(Cargo.toml)
+- 对话框请求先记到 `DialogRequest`,帧末在 `drive_dialog()` 统一处理:rfd 是阻塞调用,内置对话框也走同一条路,两条实现行为一致
+- 大数据表格用 `TableBuilder::body().rows()` 虚拟滚动,勿手写循环(文件列表同理)
 
 ## 交叉编译 Windows x64(勿走弯路)
 

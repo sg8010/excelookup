@@ -8,6 +8,9 @@ use egui_extras::{Column, TableBuilder};
 use excelookup_lib::join::{join_with_limit, JoinSpec, JoinType, KeyMode};
 use excelookup_lib::model::{CellValue, Table};
 
+#[cfg(target_os = "linux")]
+use crate::file_dialog::{self, DialogAction, FileDialog};
+
 /// 后台加载线程回主线程的消息(数据 move,不 clone)
 struct LoadMsg {
     side: Side,
@@ -98,7 +101,14 @@ pub struct ExcelLookupApp {
     load_gen: [u64; 2],
     /// 每侧是否正在后台加载
     load_active: [bool; 2],
-    pending_save: bool,
+    /// 已点击待处理的对话框请求(帧末统一处理)
+    pending_dialog: Option<DialogRequest>,
+    /// 内置文件对话框(Linux;其他平台用系统原生 rfd 对话框)
+    #[cfg(target_os = "linux")]
+    dialog: Option<ActiveDialog>,
+    /// 内置对话框上次停留的目录(下次从这里打开)
+    #[cfg(target_os = "linux")]
+    last_dir: Option<PathBuf>,
     /// 对调 A/B 后帧末统一处理(重置键列/输出列/结果)
     pending_swap: bool,
 }
@@ -144,6 +154,32 @@ impl Side {
             Self::Right => 1,
         }
     }
+
+    fn letter(self) -> &'static str {
+        match self {
+            Self::Left => "A",
+            Self::Right => "B",
+        }
+    }
+}
+
+/// 待发起的文件对话框请求
+///
+/// 不在点击处直接弹窗:系统原生对话框(rfd)是阻塞调用,统一放到帧末处理;
+/// Linux 的内置对话框也走同一条路,保证两条实现的行为一致。
+#[derive(Clone, Copy)]
+enum DialogRequest {
+    /// 为某个数据源选择工作簿
+    Open(Side),
+    /// 导出结果另存为
+    Save,
+}
+
+/// 正在显示的内置对话框(Linux)
+#[cfg(target_os = "linux")]
+struct ActiveDialog {
+    request: DialogRequest,
+    dialog: FileDialog,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -206,7 +242,11 @@ impl Default for ExcelLookupApp {
             load_tx: None,
             load_gen: [0, 0],
             load_active: [false, false],
-            pending_save: false,
+            pending_dialog: None,
+            #[cfg(target_os = "linux")]
+            dialog: None,
+            #[cfg(target_os = "linux")]
+            last_dir: None,
             pending_swap: false,
         }
     }
@@ -226,14 +266,82 @@ impl ExcelLookupApp {
         }
     }
 
-    fn pick_and_load(&mut self, side: Side, ui: &egui::Ui) {
-        let picked = rfd::FileDialog::new()
-            .add_filter("Excel 工作簿", &["xlsx", "xls", "xlsb", "xlsm", "ods"])
-            .add_filter("所有文件", &["*"])
-            .pick_file();
-        if let Some(path) = picked {
-            self.step = WorkflowStep::Sources;
-            self.start_load(side, path, ui.ctx().clone());
+    /// 请求选择工作簿:帧末统一弹对话框(见 DialogRequest)
+    fn pick_and_load(&mut self, side: Side) {
+        self.pending_dialog = Some(DialogRequest::Open(side));
+    }
+
+    /// Linux:驱动内置文件对话框(不依赖 XDG Portal / zenity)
+    #[cfg(target_os = "linux")]
+    fn drive_dialog(&mut self, ctx: &egui::Context) {
+        // 1. 新请求:建对话框(初始目录沿用上次的位置)
+        if let Some(request) = self.pending_dialog.take() {
+            let dir = self.last_dir.clone();
+            let dialog = match request {
+                DialogRequest::Open(side) => FileDialog::open(
+                    "选择工作簿",
+                    &format!("数据源 {}", side.letter()),
+                    dir,
+                    file_dialog::workbook_filters(),
+                ),
+                DialogRequest::Save => FileDialog::save(
+                    "导出结果",
+                    "保存为 Excel 工作簿",
+                    dir,
+                    "连接结果.xlsx",
+                    file_dialog::xlsx_filters(),
+                ),
+            };
+            self.dialog = Some(ActiveDialog { request, dialog });
+        }
+        // 2. 已显示的对话框:画一帧并处理结果
+        let Some(active) = &mut self.dialog else { return };
+        let action = active.dialog.ui(ctx);
+        // 记住用户停留的目录,下次从这里打开(即便这次取消了)
+        self.last_dir = Some(active.dialog.dir().to_path_buf());
+        let request = active.request;
+        match action {
+            DialogAction::None => {}
+            DialogAction::Cancelled => self.dialog = None,
+            DialogAction::Picked(path) => {
+                self.dialog = None;
+                match request {
+                    DialogRequest::Open(side) => {
+                        self.step = WorkflowStep::Sources;
+                        self.start_load(side, path, ctx.clone());
+                    }
+                    DialogRequest::Save => self.export_to(path),
+                }
+            }
+        }
+    }
+
+    /// 其他平台:系统原生对话框(rfd;阻塞调用,所以放在帧末)
+    #[cfg(not(target_os = "linux"))]
+    fn drive_dialog(&mut self, ctx: &egui::Context) {
+        let Some(request) = self.pending_dialog.take() else {
+            return;
+        };
+        match request {
+            DialogRequest::Open(side) => {
+                let picked = rfd::FileDialog::new()
+                    .add_filter("Excel 工作簿", &["xlsx", "xls", "xlsb", "xlsm", "ods"])
+                    .add_filter("所有文件", &["*"])
+                    .pick_file();
+                if let Some(path) = picked {
+                    self.step = WorkflowStep::Sources;
+                    self.start_load(side, path, ctx.clone());
+                }
+            }
+            DialogRequest::Save => {
+                let picked = rfd::FileDialog::new()
+                    .add_filter("Excel 工作簿", &["xlsx"])
+                    .set_file_name("连接结果.xlsx")
+                    .save_file();
+                if let Some(path) = picked {
+                    self.export_to(path);
+                }
+            }
         }
     }
 
@@ -542,7 +650,8 @@ impl ExcelLookupApp {
         self.step = WorkflowStep::Result;
     }
 
-    fn export(&mut self) {
+    /// 导出结果到指定路径(对话框确认后调用)
+    fn export_to(&mut self, path: PathBuf) {
         let can_export = self
             .result
             .as_ref()
@@ -551,21 +660,15 @@ impl ExcelLookupApp {
         if !can_export {
             return;
         }
-        let picked = rfd::FileDialog::new()
-            .add_filter("Excel 工作簿", &["xlsx"])
-            .set_file_name("连接结果.xlsx")
-            .save_file();
-        if let Some(path) = picked {
-            // 只借用结果表导出，避免在大结果集上再复制一整张 Table。
-            let error = self.result.as_ref().and_then(|res| {
-                excelookup_lib::export::write_xlsx(&res.table, &path)
-                    .err()
-                    .map(|e| format!("导出失败: {e}"))
-            });
-            if let Some(error) = error {
-                if let Some(r) = &mut self.result {
-                    r.err = Some(error);
-                }
+        // 只借用结果表导出，避免在大结果集上再复制一整张 Table。
+        let error = self.result.as_ref().and_then(|res| {
+            excelookup_lib::export::write_xlsx(&res.table, &path)
+                .err()
+                .map(|e| format!("导出失败: {e}"))
+        });
+        if let Some(error) = error {
+            if let Some(r) = &mut self.result {
+                r.err = Some(error);
             }
         }
     }
@@ -689,10 +792,8 @@ impl eframe::App for ExcelLookupApp {
         for msg in msgs {
             self.apply_load_result(msg.side, msg.generation, msg.path, msg.result);
         }
-        if self.pending_save {
-            self.pending_save = false;
-            self.export();
-        }
+        // 帧末:处理对话框(rfd 是阻塞调用,必须放在帧末;内置对话框也统一在这里画)
+        self.drive_dialog(ui.ctx());
         if self.pending_swap {
             self.pending_swap = false;
             self.swap_sources();
@@ -1157,7 +1258,7 @@ impl ExcelLookupApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
                 if show_export {
                     if Self::green_button(ui, "导出结果  ↓", 136.0).clicked() {
-                        self.pending_save = true;
+                        self.pending_dialog = Some(DialogRequest::Save);
                     }
                 }
             });
@@ -1205,10 +1306,7 @@ impl ExcelLookupApp {
         ui.horizontal(|ui| {
             Self::letter_badge(
                 ui,
-                match side {
-                    Side::Left => "A",
-                    Side::Right => "B",
-                },
+                side.letter(),
                 match side {
                     Side::Left => Self::blue(),
                     Side::Right => Self::teal(),
@@ -1356,14 +1454,7 @@ impl ExcelLookupApp {
         Self::card_frame(Self::surface(), Self::line(), 16).show(ui, |ui| {
             ui.set_min_height(238.0);
             ui.horizontal(|ui| {
-                Self::letter_badge(
-                    ui,
-                    match side {
-                        Side::Left => "A",
-                        Side::Right => "B",
-                    },
-                    accent,
-                );
+                Self::letter_badge(ui, side.letter(), accent);
                 ui.add_space(1.0);
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
@@ -1402,7 +1493,7 @@ impl ExcelLookupApp {
                     )
                     .clicked()
                 {
-                    self.pick_and_load(side, ui);
+                    self.pick_and_load(side);
                 }
             });
 

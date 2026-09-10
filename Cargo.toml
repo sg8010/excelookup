@@ -18,7 +18,10 @@ eframe = { version = "0.36", default-features = false, features = ["default_font
 egui_extras = "0.36"
 calamine = "0.36"
 rust_xlsxwriter = "0.99"
-# Linux 使用 XDG Desktop Portal;Portal 不可用时由 rfd 回退到 Zenity。
-# 不把 GTK3 直接链接进主程序,避免目标机 GTK/GLX 驱动冲突。
-rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 anyhow = "1"
+
+# Linux 目标不使用 rfd:它靠 XDG Desktop Portal,Portal 缺失时会回退成调用
+# `zenity` 外部进程,精简桌面/无桌面环境上会直接没反应。Linux 改用内置的 egui
+# 文件对话框(src/file_dialog.rs + excelookup_lib::filebrowser),只依赖 std::fs。
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rfd = { version = "0.17", default-features = false }
