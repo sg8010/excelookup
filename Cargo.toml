@@ -3,6 +3,7 @@ name = "excelookup"
 version = "0.1.0"
 edition = "2024"
 default-run = "excelookup"
+description = "图形化的 Excel 双表连接工具"
 
 [lib]
 name = "excelookup_lib"
@@ -11,6 +12,16 @@ path = "src/lib.rs"
 [[bin]]
 name = "excelookup"
 path = "src/main.rs"
+
+[package.metadata.deb]
+maintainer = "sg8010 <sg8011@outlook.com>"
+copyright = "sg8010"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/excelookup", "usr/bin/excelookup", "755"],
+]
 
 [dependencies]
 # Linux 目标仅需 X11 + glow(OpenGL) 渲染;关 default 去掉 wayland/wgpu/accesskit。

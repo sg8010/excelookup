@@ -31,9 +31,12 @@ jobs:
       - name: 装 rustup + gcc
         run: |
           apt-get install -y --no-install-recommends \
-            curl ca-certificates gcc libc6-dev
+            curl ca-certificates gcc libc6-dev dpkg-dev
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: 安装 cargo-deb
+        run: cargo install cargo-deb --locked --version 3.8.0
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -43,6 +46,21 @@ jobs:
 
       - name: Build (release)
         run: cargo build --release
+
+      - name: 打包 Debian 软件包
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            cargo deb --no-build --deb-version "${GITHUB_REF_NAME#v}-1"
+          else
+            cargo deb --no-build
+          fi
+
+      - name: 校验 Debian 软件包
+        run: |
+          DEB=$(find target/debian -maxdepth 1 -type f -name '*.deb' -print -quit)
+          test -n "$DEB"
+          dpkg-deb --info "$DEB"
+          test "$(dpkg-deb --field "$DEB" Architecture)" = "arm64"
 
       - name: 校验产物 glibc 需求 ≤ 2.28
         run: |
@@ -59,11 +77,17 @@ jobs:
           fi
           echo "✅ 产物 glibc 需求 ≤ 2.28"
 
-      - name: Upload artifact
+      - name: 准备发布文件
+        run: |
+          mkdir -p dist
+          cp target/release/excelookup dist/excelookup-linux-arm64
+          cp target/debian/*.deb dist/
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: excelookup-linux-arm64
-          path: target/release/excelookup
+          path: dist/*
           if-no-files-found: error
 
   release:
@@ -77,13 +101,11 @@ jobs:
           name: excelookup-linux-arm64
           path: dist
 
-      - name: Prepare binary
-        run: |
-          chmod +x dist/excelookup
-          mv dist/excelookup dist/excelookup-linux-arm64
+      - name: 设置裸二进制权限
+        run: chmod +x dist/excelookup-linux-arm64
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/excelookup-linux-arm64
+          files: dist/*
           generate_release_notes: true
