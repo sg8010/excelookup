@@ -49,11 +49,10 @@ jobs:
 
       - name: 打包 Debian 软件包
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            cargo deb --no-build --deb-version "${GITHUB_REF_NAME#v}-1"
-          else
-            cargo deb --no-build
-          fi
+          case "$GITHUB_REF" in
+            refs/tags/v*) cargo deb --no-build --deb-version "${GITHUB_REF_NAME#v}-1" ;;
+            *) cargo deb --no-build ;;
+          esac
 
       - name: 校验 Debian 软件包
         run: |
