@@ -25,8 +25,19 @@
 
 ## 下载
 
-- **Linux arm64**(麒麟 / UOS / 树莓派等):从 [Releases](https://github.com/sg8010/excelookup/releases) 下载 `excelookup-linux-arm64`
+- **Linux arm64**(麒麟 / UOS / 树莓派等):从 [Releases](https://github.com/sg8010/excelookup/releases) 下载裸二进制或 Debian 软件包
 - **Windows x64**:见下方「从源码构建」,或等待 Release 附件
+
+### Debian 软件包安装
+
+Debian 软件包按系统规范安装到 `/usr/bin/excelookup`，并自动创建桌面菜单项：
+
+```bash
+sudo apt install ./excelookup_版本_arm64.deb
+# 程序：/usr/bin/excelookup
+```
+
+如果只下载裸二进制文件，可直接运行：
 
 ```bash
 chmod +x excelookup-linux-arm64

@@ -19,8 +19,11 @@ copyright = "sg8010"
 section = "utils"
 priority = "optional"
 depends = "$auto"
+maintainer-scripts = "debian"
 assets = [
     ["target/release/excelookup", "usr/bin/excelookup", "755"],
+    ["assets/excelookup.desktop", "usr/share/applications/excelookup.desktop", "644"],
+    ["assets/icon.png", "usr/share/icons/hicolor/256x256/apps/excelookup.png", "644"],
 ]
 
 [dependencies]

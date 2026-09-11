@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=ExcelLookup
+Comment=图形化的 Excel 双表连接工具
+Exec=excelookup
+Icon=excelookup
+Terminal=false
+Categories=Office;Utility;
+StartupNotify=true
