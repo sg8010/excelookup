@@ -590,11 +590,20 @@ impl FileDialog {
                             } else {
                                 (palette::ink(), "▪ ")
                             };
-                            ui.label(
-                                egui::RichText::new(format!("{mark}{}", entry.name))
-                                    .size(14.0)
-                                    .color(color),
-                            );
+                            let response = ui
+                                .label(
+                                    egui::RichText::new(format!("{mark}{}", entry.name))
+                                        .size(14.0)
+                                        .color(color),
+                                )
+                                // 标签默认只响应 hover，会挡住表格行的点击；把点击能力
+                                // 加回标签本身，文件名文字和行内空白区域行为保持一致。
+                                .interact(egui::Sense::click());
+                            if response.double_clicked() {
+                                row_intent = Some(RowIntent::Activate(entry.path.clone(), is_dir));
+                            } else if response.clicked() {
+                                row_intent = Some(RowIntent::Select(entry.path.clone()));
+                            }
                         });
                         row.col(|ui| {
                             ui.label(
@@ -611,6 +620,9 @@ impl FileDialog {
                             );
                         });
                         let response = row.response();
+                        if row_intent.is_some() {
+                            return;
+                        }
                         if response.double_clicked() {
                             row_intent = Some(RowIntent::Activate(entry.path.clone(), is_dir));
                         } else if response.clicked() {
