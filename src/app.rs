@@ -1,10 +1,12 @@
 //! ExcelLookup 主应用界面 (egui)
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke};
 use egui_extras::{Column, TableBuilder};
 
+use excelookup_lib::export::{ExportPhase, ExportProgress};
 use excelookup_lib::join::{join_with_limit, JoinSpec, JoinType, KeyMode};
 use excelookup_lib::model::{CellValue, Table};
 use excelookup_lib::read_xlsx::{ReadOptions, SheetTable};
@@ -23,6 +25,27 @@ struct LoadMsg {
     header_rows: Vec<Option<usize>>,
     /// 成功 = 各工作表;失败 = 错误文案
     result: std::result::Result<Vec<SheetTable>, String>,
+}
+
+/// 后台导出线程回主线程的消息。
+enum ExportMsg {
+    Progress {
+        generation: u64,
+        progress: ExportProgress,
+    },
+    Finished {
+        generation: u64,
+        result: std::result::Result<(), String>,
+    },
+}
+
+/// 导出状态。结果表通过 Arc 与后台线程共享,避免为导出再复制一份大表。
+#[derive(Default)]
+enum ExportState {
+    #[default]
+    Idle,
+    Running(ExportProgress),
+    Done,
 }
 
 /// 一个已打开的数据源(文件 + sheets)
@@ -110,6 +133,12 @@ pub struct ExcelLookupApp {
     load_gen: [u64; 2],
     /// 每侧是否正在后台加载
     load_active: [bool; 2],
+    /// 后台导出通道收端
+    export_rx: Option<std::sync::mpsc::Receiver<ExportMsg>>,
+    /// 导出请求世代号:清空/重算结果时递增,使旧线程结果失效
+    export_gen: u64,
+    /// 当前导出状态
+    export_state: ExportState,
     /// 已点击待处理的对话框请求(帧末统一处理)
     pending_dialog: Option<DialogRequest>,
     /// 内置文件对话框(Linux;其他平台用系统原生 rfd 对话框)
@@ -132,7 +161,7 @@ enum RowFilter {
 }
 
 struct JoinOutcome {
-    table: Table,
+    table: Arc<Table>,
     left_matched: usize,
     left_total: usize,
     right_matched_rows: usize,
@@ -251,6 +280,9 @@ impl Default for ExcelLookupApp {
             load_tx: None,
             load_gen: [0, 0],
             load_active: [false, false],
+            export_rx: None,
+            export_gen: 0,
+            export_state: ExportState::Idle,
             pending_dialog: None,
             #[cfg(target_os = "linux")]
             dialog: None,
@@ -278,6 +310,106 @@ impl ExcelLookupApp {
     /// 请求选择工作簿:帧末统一弹对话框(见 DialogRequest)
     fn pick_and_load(&mut self, side: Side) {
         self.pending_dialog = Some(DialogRequest::Open(side));
+    }
+
+    /// 使当前导出请求失效。后台线程仍可安全地完成,但其消息不会再写回新状态。
+    fn invalidate_export(&mut self) {
+        self.export_gen = self.export_gen.wrapping_add(1);
+        self.export_rx = None;
+        self.export_state = ExportState::Idle;
+    }
+
+    fn export_active(&self) -> bool {
+        matches!(self.export_state, ExportState::Running(_))
+    }
+
+    /// 启动后台导出。结果表只通过 Arc 共享,不会因导出再复制一整张大表。
+    fn start_export(&mut self, path: PathBuf, ctx: egui::Context) {
+        if self.export_active() {
+            return;
+        }
+        let Some(table) = self
+            .result
+            .as_ref()
+            .filter(|result| result.err.is_none() && result.table.col_count() > 0)
+            .map(|result| Arc::clone(&result.table))
+        else {
+            return;
+        };
+
+        self.invalidate_export();
+        let generation = self.export_gen;
+        let total_rows = table.row_count();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.export_rx = Some(rx);
+        self.export_state = ExportState::Running(ExportProgress {
+            phase: ExportPhase::Writing,
+            completed_rows: 0,
+            total_rows,
+        });
+        ctx.request_repaint();
+
+        let repaint_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let export_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                excelookup_lib::export::write_xlsx_with_progress(
+                    &table,
+                    &path,
+                    |progress| {
+                        let _ = tx.send(ExportMsg::Progress {
+                            generation,
+                            progress,
+                        });
+                        repaint_ctx.request_repaint();
+                    },
+                )
+            }))
+            .map_err(|_| "导出过程发生内部错误（已中止）".to_owned())
+            .and_then(|result| result.map_err(|e| format!("{e}")));
+
+            let _ = tx.send(ExportMsg::Finished {
+                generation,
+                result: export_result,
+            });
+            repaint_ctx.request_repaint();
+        });
+    }
+
+    /// 每帧非阻塞地收取导出进度和完成消息。
+    fn poll_export(&mut self) {
+        let messages: Vec<ExportMsg> = if let Some(rx) = &self.export_rx {
+            let mut messages = Vec::new();
+            while let Ok(message) = rx.try_recv() {
+                messages.push(message);
+            }
+            messages
+        } else {
+            Vec::new()
+        };
+
+        for message in messages {
+            match message {
+                ExportMsg::Progress {
+                    generation,
+                    progress,
+                } if generation == self.export_gen && self.export_active() => {
+                    self.export_state = ExportState::Running(progress);
+                }
+                ExportMsg::Finished { generation, result } if generation == self.export_gen => {
+                    self.export_rx = None;
+                    match result {
+                        Ok(()) => self.export_state = ExportState::Done,
+                        Err(error) => {
+                            if let Some(result) = &mut self.result {
+                                result.err = Some(format!("导出失败: {error}"));
+                            }
+                            self.export_state = ExportState::Idle;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Linux:驱动内置文件对话框(不依赖 XDG Portal / zenity)
@@ -320,7 +452,7 @@ impl ExcelLookupApp {
                         // 新文件:列名行全部重新自动
                         self.start_load(side, path, Vec::new(), ctx.clone());
                     }
-                    DialogRequest::Save => self.export_to(path),
+                    DialogRequest::Save => self.start_export(path, ctx.clone()),
                 }
             }
         }
@@ -350,7 +482,7 @@ impl ExcelLookupApp {
                     .set_file_name("连接结果.xlsx")
                     .save_file();
                 if let Some(path) = picked {
-                    self.export_to(path);
+                    self.start_export(path, ctx.clone());
                 }
             }
         }
@@ -500,6 +632,7 @@ impl ExcelLookupApp {
     /// 某侧的表被替换/切换后调用:清空该侧键列选择(严格版:即使下标合法也不保留,避免
     /// "下标合法但列含义已变"的静默错误),并清空该侧输出列(若为 B)。另一侧不受影响。
     fn reset_side_on_source_change(&mut self, side: Side) {
+        self.invalidate_export();
         match side {
             Side::Left => {
                 self.left_key_col = None;
@@ -512,9 +645,10 @@ impl ExcelLookupApp {
     }
 
     fn run_join(&mut self) {
+        self.invalidate_export();
         if !self.left.is_loaded() || !self.right.is_loaded() {
             self.result = Some(JoinOutcome {
-                table: Table::default(),
+                table: Arc::new(Table::default()),
                 left_matched: 0,
                 left_total: 0,
                 right_matched_rows: 0,
@@ -542,7 +676,7 @@ impl ExcelLookupApp {
         let rc = right_t.col_count();
         if lc == 0 || rc == 0 {
             self.result = Some(JoinOutcome {
-                table: Table::default(),
+                table: Arc::new(Table::default()),
                 left_matched: 0,
                 left_total: 0,
                 right_matched_rows: 0,
@@ -561,7 +695,7 @@ impl ExcelLookupApp {
         // 键列未选择或当前表无列时不允许执行
         let (Some(lk), Some(rk)) = (self.left_key_col, self.right_key_col) else {
             self.result = Some(JoinOutcome {
-                table: Table::default(),
+                table: Arc::new(Table::default()),
                 left_matched: 0,
                 left_total: 0,
                 right_matched_rows: 0,
@@ -668,7 +802,7 @@ impl ExcelLookupApp {
                 lines.push("4. 若确认键列无误仍过大,可先对 A 表筛选/去重后再连接。".into());
 
                 self.result = Some(JoinOutcome {
-                    table: Table::default(),
+                    table: Arc::new(Table::default()),
                     left_matched: 0,
                     left_total: 0,
                     right_matched_rows: 0,
@@ -687,7 +821,7 @@ impl ExcelLookupApp {
         };
         let matched_rows = res.row_hit.iter().filter(|&&h| h).count();
         self.result = Some(JoinOutcome {
-            table: res.table,
+            table: Arc::new(res.table),
             left_matched: res.left_matched,
             left_total: res.left_total,
             right_matched_rows: res.right_matched_rows,
@@ -704,30 +838,8 @@ impl ExcelLookupApp {
         self.step = WorkflowStep::Result;
     }
 
-    /// 导出结果到指定路径(对话框确认后调用)
-    fn export_to(&mut self, path: PathBuf) {
-        let can_export = self
-            .result
-            .as_ref()
-            .map(|res| res.err.is_none() && res.table.col_count() > 0)
-            .unwrap_or(false);
-        if !can_export {
-            return;
-        }
-        // 只借用结果表导出，避免在大结果集上再复制一整张 Table。
-        let error = self.result.as_ref().and_then(|res| {
-            excelookup_lib::export::write_xlsx(&res.table, &path)
-                .err()
-                .map(|e| format!("导出失败: {e}"))
-        });
-        if let Some(error) = error {
-            if let Some(r) = &mut self.result {
-                r.err = Some(error);
-            }
-        }
-    }
-
     fn clear_result(&mut self) {
+        self.invalidate_export();
         self.result = None;
         self.row_filter = None;
         if self.sources_ready() {
@@ -736,6 +848,7 @@ impl ExcelLookupApp {
     }
 
     fn clear_sources(&mut self) {
+        self.invalidate_export();
         self.left = Source::default();
         self.right = Source::default();
         self.left_key_col = None;
@@ -755,6 +868,7 @@ impl ExcelLookupApp {
     /// 守恒,即便某侧此前未选择,交换后仍为 None。
     /// 输出列清空——主从关系已变,带出字段需重新确认。
     fn swap_sources(&mut self) {
+        self.invalidate_export();
         std::mem::swap(&mut self.left, &mut self.right);
         std::mem::swap(&mut self.left_key_col, &mut self.right_key_col);
         self.right_pick_cols.clear();
@@ -852,6 +966,7 @@ impl eframe::App for ExcelLookupApp {
                 msg.result,
             );
         }
+        self.poll_export();
         // 帧末:处理对话框(rfd 是阻塞调用,必须放在帧末;内置对话框也统一在这里画)
         self.drive_dialog(ui.ctx());
         if self.pending_swap {
@@ -1292,7 +1407,8 @@ impl ExcelLookupApp {
     }
 
     fn ui_page_heading(&mut self, ui: &mut egui::Ui) {
-        let show_export = self.step == WorkflowStep::Result && self.result_ready();
+        let export_active = self.export_active();
+        let show_export = self.step == WorkflowStep::Result && self.result_ready() && !export_active;
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
@@ -1316,7 +1432,14 @@ impl ExcelLookupApp {
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
-                if show_export {
+                if export_active {
+                    ui.label(
+                        egui::RichText::new("正在导出")
+                            .size(13.0)
+                            .strong()
+                            .color(Self::blue()),
+                    );
+                } else if show_export {
                     if Self::green_button(ui, "导出结果  ↓", 136.0).clicked() {
                         self.pending_dialog = Some(DialogRequest::Save);
                     }
@@ -1987,7 +2110,9 @@ impl ExcelLookupApp {
     // ---------- 第三步:结果预览 ----------
 
     fn ui_step_result(&mut self, ui: &mut egui::Ui) {
-        let status = if self.result_ready() {
+        let status = if self.export_active() {
+            Some("正在导出")
+        } else if self.result_ready() {
             Some("连接完成")
         } else {
             None
@@ -2003,6 +2128,7 @@ impl ExcelLookupApp {
     }
 
     fn ui_result_body(&mut self, ui: &mut egui::Ui) {
+        self.ui_export_progress(ui);
         let Some(result) = &self.result else {
             ui.vertical_centered(|ui| {
                 ui.add_space(24.0);
@@ -2262,6 +2388,72 @@ impl ExcelLookupApp {
             } else {
                 egui::CursorIcon::Default
             })
+    }
+
+    fn ui_export_progress(&self, ui: &mut egui::Ui) {
+        match &self.export_state {
+            ExportState::Running(progress) => {
+                let (phase_label, fraction, detail) = match progress.phase {
+                    ExportPhase::Writing => {
+                        let fraction = if progress.total_rows == 0 {
+                            0.85
+                        } else {
+                            (progress.completed_rows as f32 / progress.total_rows as f32 * 0.85)
+                                .min(0.85)
+                        };
+                        (
+                            "正在写入数据…",
+                            fraction,
+                            format!(
+                                "已写入 {} / {} 行",
+                                progress.completed_rows, progress.total_rows
+                            ),
+                        )
+                    }
+                    ExportPhase::Saving => {
+                        ("正在压缩工作簿…", 0.92, "大数据量保存需要一些时间".to_owned())
+                    }
+                };
+
+                Self::card_frame(Self::surface(), Self::line(), 13).show(ui, |ui| {
+                    ui.set_min_width(600.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("正在导出")
+                                .size(15.0)
+                                .strong()
+                                .color(Self::blue()),
+                        );
+                        ui.label(
+                            egui::RichText::new(phase_label)
+                                .size(13.0)
+                                .color(Self::muted()),
+                        );
+                    });
+                    ui.add_space(7.0);
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .desired_width(420.0)
+                            .show_percentage()
+                            .animate(true),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(detail).size(12.0).color(Self::soft()));
+                });
+                ui.add_space(10.0);
+            }
+            ExportState::Done => {
+                Self::card_frame(Self::surface(), Self::line(), 13).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("导出完成，可打开刚保存的工作簿。")
+                            .size(13.0)
+                            .color(Self::blue()),
+                    );
+                });
+                ui.add_space(10.0);
+            }
+            ExportState::Idle => {}
+        }
     }
 
     fn ui_result_table(&self, ui: &mut egui::Ui) {

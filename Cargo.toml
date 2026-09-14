@@ -26,12 +26,18 @@ assets = [
     ["assets/icon.png", "usr/share/icons/hicolor/256x256/apps/excelookup.png", "644"],
 ]
 
+[profile.release]
+# Win7 target 不能把未使用的高版本 Windows API 留在 PE 导入表中。
+# fat LTO 会跨 crate 删除 arboard 的文件列表剪贴板代码，其中包含
+# Windows 8 才提供的 PathCchStripPrefix；同时也让最终导入表更容易审计。
+lto = "fat"
+
 [dependencies]
 # Linux 目标仅需 X11 + glow(OpenGL) 渲染;关 default 去掉 wayland/wgpu/accesskit。
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "links", "glow", "x11"] }
 egui_extras = "0.36"
 calamine = "0.36"
-rust_xlsxwriter = "0.99"
+rust_xlsxwriter = { version = "0.99", features = ["constant_memory"] }
 anyhow = "1"
 
 # Linux 目标不使用 rfd:它靠 XDG Desktop Portal,Portal 缺失时会回退成调用

@@ -26,7 +26,7 @@
 ## 下载
 
 - **Linux arm64**(麒麟 / UOS / 树莓派等):从 [Releases](https://github.com/sg8010/excelookup/releases) 下载裸二进制或 Debian 软件包
-- **Windows x64**:见下方「从源码构建」,或等待 Release 附件
+- **Windows x64 / x86**(Windows 7 及以上):见下方「从源码构建」,或等待 Release 附件
 
 ### Debian 软件包安装
 
@@ -67,16 +67,31 @@ chmod +x excelookup-linux-arm64
 cargo build --release            # 产物: target/release/excelookup
 ```
 
-### Windows x64(在 Linux 上交叉编译)
+### Windows 7+ x64/x86(在 Linux 上交叉编译)
 
 ```bash
-# 依赖: mingw-w64
-sudo apt install -y gcc-mingw-w64-x86-64
+# 依赖: mingw-w64 + rustup
+sudo apt install -y \
+  gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
+  gcc-mingw-w64-i686 binutils-mingw-w64-i686
 
-./scripts/build-win.sh           # 产物: target/x86_64-pc-windows-gnu/release/excelookup.exe
+# 脚本会自动安装 nightly 的 rust-src(Win7 target 没有预编译 std)
+./scripts/build-win.sh           # 同时构建 x64 与 x86
 ```
 
-交叉链接器配置见 `.cargo/config.toml`(使用系统 `x86_64-w64-mingw32-gcc`)。
+产物分别为:
+
+```text
+target/x86_64-win7-windows-gnu/release/excelookup.exe
+target/i686-win7-windows-gnu/release/excelookup.exe
+```
+
+该构建使用 Rust 官方 `x86_64-win7-windows-gnu` / `i686-win7-windows-gnu`
+target、nightly `build-std`、release `fat LTO` 及
+`rust_xlsxwriter` 的 `constant_memory` 模式，保留文本/图片剪贴板，不引用
+Windows 8 的 `PathCchStripPrefix`，并在构建结束时检查两个 PE 导入表。
+交叉链接器配置见 `.cargo/config.toml`(分别使用
+`x86_64-w64-mingw32-gcc` 和 `i686-w64-mingw32-gcc`)。
 
 ## 测试
 
