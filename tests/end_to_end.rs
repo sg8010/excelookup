@@ -7,7 +7,7 @@ use rust_xlsxwriter::Workbook;
 use excelookup_lib::export::write_joined_xlsx;
 use excelookup_lib::join::{join, JoinSpec, JoinType, KeyMode};
 use excelookup_lib::model::CellValue;
-use excelookup_lib::read_xlsx::{read_workbook, read_workbook_opts, ReadOptions};
+use excelookup_lib::read_xlsx::{read_sheet_opts, read_workbook, read_workbook_opts, ReadOptions};
 
 /// 生成一个临时 xlsx:两个 sheet,left 与 right
 fn make_wb(path: &PathBuf) {
@@ -319,6 +319,12 @@ fn end_to_end_header_rows_are_per_sheet() {
     assert_eq!(sheets[1].table.headers, vec!["id", "城市"]); // 未被第 1 个 sheet 的选择带偏
     assert_eq!(sheets[1].table.row_count(), 1);
     assert_eq!(sheets[1].used_header_row, Some(0));
+
+    // 改列名行时只读目标工作表,不需要重新构造整个工作簿。
+    let single = read_sheet_opts(&path, "带标题", Some(1), true).unwrap();
+    assert_eq!(single.name, "带标题");
+    assert_eq!(single.table.headers, vec!["id", "名称"]);
+    assert_eq!(single.table.row_count(), 1);
 
     // 反向:给第 2 个 sheet 指定一个它没有的行 → 只有它回退(第 1 个不受影响)
     let opts = ReadOptions {

@@ -34,6 +34,11 @@ pub struct SheetTable {
     pub table: Table,
     /// 已用区域顶部前 [`PREVIEW_ROWS`] 行(按展示文本;含被当作列名的行)
     pub preview: Vec<Vec<String>>,
+    /// 预览行的类型化单元格,供 GUI 在预览窗口内切换列名行时复用数据。
+    pub preview_cells: Vec<Vec<CellValue>>,
+    /// 预览行是否包含至少一个原始非空单元格(Data::String("")也算非空)
+    /// (错误单元格也算非空,与原始 Range 的判断保持一致)。
+    pub preview_non_empty: Vec<bool>,
     /// 自动检测到的列名行(已用区域 0-based);整表全空为 None
     pub auto_header_row: Option<usize>,
     /// 实际用作列名的行(已用区域 0-based):指定行越界/全空而回退自动时与
@@ -76,6 +81,25 @@ pub fn read_workbook_opts(path: &Path, opts: ReadOptions) -> Result<Vec<SheetTab
     Ok(out)
 }
 
+/// 只读取工作簿中的一个工作表。
+///
+/// 改列名行时调用此函数即可,避免为了重建当前表而重新解析整个工作簿。
+pub fn read_sheet_opts(
+    path: &Path,
+    sheet_name: &str,
+    requested: Option<usize>,
+    preview: bool,
+) -> Result<SheetTable> {
+    let mut workbook = open_workbook_auto(path)
+        .with_context(|| format!("无法打开文件: {}", path.display()))?;
+    let mut range = workbook
+        .worksheet_range(sheet_name)
+        .with_context(|| format!("读取工作表「{}」失败", sheet_name))?;
+    let mut sheet = table_from_range(&mut range, requested, preview);
+    sheet.name = sheet_name.to_owned();
+    Ok(sheet)
+}
+
 /// 已用区域内第一个非空行(前导空行全部跳过)
 fn first_non_empty_row(range: &calamine::Range<Data>, height: usize) -> Option<usize> {
     (0..height).find(|&ri| range[ri].iter().any(|c| !matches!(c, Data::Empty)))
@@ -109,12 +133,19 @@ fn table_from_range(
     }
 
     // 0. 顶部原始行预览(仅前 PREVIEW_ROWS 行,数据移动前先取文本)
-    let preview: Vec<Vec<String>> = if preview_wanted {
-        (0..height.min(PREVIEW_ROWS))
-            .map(|ri| range[ri].iter().map(data_display).collect())
-            .collect()
+    let (preview, preview_cells, preview_non_empty) = if preview_wanted {
+        let mut preview = Vec::with_capacity(height.min(PREVIEW_ROWS));
+        let mut preview_cells = Vec::with_capacity(height.min(PREVIEW_ROWS));
+        let mut preview_non_empty = Vec::with_capacity(height.min(PREVIEW_ROWS));
+        for ri in 0..height.min(PREVIEW_ROWS) {
+            let row = &range[ri];
+            preview_non_empty.push(row.iter().any(|c| !matches!(c, Data::Empty)));
+            preview.push(row.iter().map(data_display).collect());
+            preview_cells.push(row.iter().map(data_clone_cell).collect());
+        }
+        (preview, preview_cells, preview_non_empty)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new(), Vec::new())
     };
 
     // 1. 定位列名行:指定行越界或整行全空 → 回退自动
@@ -126,6 +157,8 @@ fn table_from_range(
     let Some(header_idx) = header_idx else {
         return SheetTable {
             preview,
+            preview_cells,
+            preview_non_empty,
             first_row_number: range.start().map_or(1, |(r, _)| r as usize + 1),
             ..SheetTable::default()
         };
@@ -174,10 +207,18 @@ fn table_from_range(
         name: String::new(),
         table,
         preview,
+        preview_cells,
+        preview_non_empty,
         auto_header_row: auto,
         used_header_row: Some(header_idx),
         first_row_number: range.start().map_or(1, |(r, _)| r as usize + 1),
     }
+}
+
+/// 复制预览用的类型化单元格;预览最多只有 [`PREVIEW_ROWS`] 行,额外开销很小。
+fn data_clone_cell(d: &Data) -> CellValue {
+    let mut copied = d.clone();
+    data_take_cell(&mut copied)
 }
 
 /// 移动版 data→cell:把可变 Data 中的 String 等 take 出来(留下 Data::Empty),

@@ -23,6 +23,8 @@ struct LoadMsg {
     path: PathBuf,
     /// 本次读取请求的列名行(按工作表顺序;空 = 全部自动)
     header_rows: Vec<Option<usize>>,
+    /// None = 读取整个工作簿;Some = 只替换这个工作表(改列名行时使用)
+    sheet_idx: Option<usize>,
     /// 成功 = 各工作表;失败 = 错误文案
     result: std::result::Result<Vec<SheetTable>, String>,
 }
@@ -58,6 +60,8 @@ struct LoadedSheet {
     name: String,
     table: Arc<Table>,
     preview: Vec<Vec<String>>,
+    preview_cells: Vec<Vec<CellValue>>,
+    preview_non_empty: Vec<bool>,
     auto_header_row: Option<usize>,
     used_header_row: Option<usize>,
     first_row_number: usize,
@@ -69,6 +73,8 @@ impl From<SheetTable> for LoadedSheet {
             name: sheet.name,
             table: Arc::new(sheet.table),
             preview: sheet.preview,
+            preview_cells: sheet.preview_cells,
+            preview_non_empty: sheet.preview_non_empty,
             auto_header_row: sheet.auto_header_row,
             used_header_row: sheet.used_header_row,
             first_row_number: sheet.first_row_number,
@@ -547,11 +553,154 @@ impl ExcelLookupApp {
         header_rows: Vec<Option<usize>>,
         ctx: egui::Context,
     ) {
+        self.start_load_request(side, path, header_rows, None, ctx);
+    }
+
+    /// 改列名行时只重读当前工作表,不重新构造同一工作簿的其他表。
+    fn start_sheet_reload(
+        &mut self,
+        side: Side,
+        path: PathBuf,
+        header_rows: Vec<Option<usize>>,
+        sheet_idx: usize,
+        ctx: egui::Context,
+    ) {
+        // 先释放旧连接结果:如果源表没有被其他快照引用,下面可以直接复用其行数据。
+        self.invalidate_export();
+        self.result = None;
+        self.row_filter = None;
+        if self.try_reheader_sheet(side, sheet_idx, &header_rows) {
+            // 没有后台请求,也要让可能残留的旧消息失效。
+            self.load_gen[side.index()] += 1;
+            self.reset_side_on_source_change(side);
+            return;
+        }
+        self.start_load_request(side, path, header_rows, Some(sheet_idx), ctx);
+    }
+
+    /// 在顶部候选行范围内切换列名行时,直接复用当前表的行 Vec。
+    ///
+    /// 这种路径不需要重新打开文件,也不会同时保留新旧大表。若当前表仍被
+    /// 结果视图/导出线程引用,或目标行不在顶部候选范围内,返回 false 走后台重读。
+    fn try_reheader_sheet(
+        &mut self,
+        side: Side,
+        sheet_idx: usize,
+        header_rows: &[Option<usize>],
+    ) -> bool {
+        let success = {
+            let src = match side {
+                Side::Left => &mut self.left,
+                Side::Right => &mut self.right,
+            };
+            let sheet_count = src.sheets.len();
+            let Some(sheet) = src.sheets.get_mut(sheet_idx) else {
+                return false;
+            };
+            let Some(current_idx) = sheet.used_header_row else {
+                return false;
+            };
+            let requested = header_rows.get(sheet_idx).copied().flatten();
+            let target_idx = match requested {
+                None => match sheet.auto_header_row {
+                    Some(index) => index,
+                    None => return false,
+                },
+                Some(index) if index == current_idx => index,
+                Some(index) => {
+                    if index >= sheet.preview.len()
+                        || index >= sheet.preview_non_empty.len()
+                    {
+                        return false;
+                    }
+                    if sheet.preview_non_empty[index] {
+                        index
+                    } else {
+                        match sheet.auto_header_row {
+                            Some(index) => index,
+                            None => return false,
+                        }
+                    }
+                }
+            };
+
+            if target_idx != current_idx {
+                if current_idx >= sheet.preview_non_empty.len()
+                    || target_idx >= sheet.preview_non_empty.len()
+                    || current_idx >= sheet.preview_cells.len()
+                    || target_idx >= sheet.preview_cells.len()
+                    || !sheet.preview_non_empty[target_idx]
+                {
+                    return false;
+                }
+                let old_table = std::mem::replace(
+                    &mut sheet.table,
+                    Arc::new(Table::default()),
+                );
+                let mut table = match Arc::try_unwrap(old_table) {
+                    Ok(table) => table,
+                    Err(old_table) => {
+                        sheet.table = old_table;
+                        return false;
+                    }
+                };
+                if target_idx > current_idx {
+                    let drop_count = (current_idx + 1..=target_idx)
+                        .filter(|&index| sheet.preview_non_empty[index])
+                        .count();
+                    if drop_count > table.rows.len() {
+                        sheet.table = Arc::new(table);
+                        return false;
+                    }
+                    table.rows.drain(..drop_count).for_each(drop);
+                } else {
+                    // 向前切换时,从顶部候选行缓存恢复原列名行与其后的前置数据行;
+                    // 仅复制至多 PREVIEW_ROWS 行,大表正文仍然直接移动。
+                    let mut prefix_rows = Vec::with_capacity(current_idx - target_idx);
+                    for index in (target_idx + 1)..=current_idx {
+                        if sheet.preview_non_empty[index] {
+                            prefix_rows.push(sheet.preview_cells[index].clone());
+                        }
+                    }
+                    let old_rows = std::mem::take(&mut table.rows);
+                    prefix_rows.reserve(old_rows.len());
+                    prefix_rows.extend(old_rows);
+                    table.rows = prefix_rows;
+                }
+                table.headers = Self::headers_from_preview(
+                    &sheet.preview[target_idx],
+                    table.col_count(),
+                );
+                sheet.table = Arc::new(table);
+                sheet.used_header_row = Some(target_idx);
+            }
+
+            let mut requested_rows = header_rows.to_vec();
+            requested_rows.resize(sheet_count, None);
+            src.header_rows = requested_rows;
+            true
+        };
+        success
+    }
+
+    fn start_load_request(
+        &mut self,
+        side: Side,
+        path: PathBuf,
+        header_rows: Vec<Option<usize>>,
+        sheet_idx: Option<usize>,
+        ctx: egui::Context,
+    ) {
         let idx = side.index();
         // 旧请求结果作废:世代 +1;正在跑的旧线程结果回来时 gen 不匹配会被丢弃
         self.load_gen[idx] += 1;
         let generation = self.load_gen[idx];
         self.load_active[idx] = true;
+        // 新请求会使旧的连接结果立即失效,先释放可能很大的结果表,避免与新表
+        // 一起存活到后台加载完成。
+        self.invalidate_export();
+        self.result = None;
+        self.row_filter = None;
         // 新加载开始:清掉旧错误(加载成功/失败后再按结果设置)
         match side {
             Side::Left => self.left.error = None,
@@ -565,19 +714,37 @@ impl ExcelLookupApp {
             self.load_tx = Some(tx);
         }
         let tx = self.load_tx.as_ref().expect("load_tx 已初始化").clone();
+        // 只重读当前表时,先在主线程记住名称;后台线程无需访问 GUI 状态。
+        let sheet_name = sheet_idx.and_then(|sheet_idx| match side {
+            Side::Left => self.left.sheets.get(sheet_idx),
+            Side::Right => self.right.sheets.get(sheet_idx),
+        })
+        .map(|sheet| sheet.name.clone());
         // 立即刷新一次 UI 显示"加载中…"(否则要等下次交互才重绘)
         ctx.request_repaint();
-        // 线程只依赖 lib + repaint 句柄(不碰 GUI 状态),成功后整表 move 回主线程,不 clone。
+        // 线程只依赖 lib + repaint 句柄(不碰 GUI 状态),成功后数据 move 回主线程,不 clone。
         // catch_unwind:即使解析 panic 也发回错误消息,避免 UI 永远停在"加载中"。
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(|| {
-                excelookup_lib::read_xlsx::read_workbook_opts(
-                    &path,
-                    ReadOptions {
-                        header_rows: header_rows.clone(),
-                        preview: true,
-                    },
-                )
+                match (sheet_idx, sheet_name.as_deref()) {
+                    (Some(sheet_idx), Some(sheet_name)) => {
+                        let requested = header_rows.get(sheet_idx).copied().flatten();
+                        excelookup_lib::read_xlsx::read_sheet_opts(
+                            &path,
+                            sheet_name,
+                            requested,
+                            true,
+                        )
+                        .map(|sheet| vec![sheet])
+                    }
+                    _ => excelookup_lib::read_xlsx::read_workbook_opts(
+                        &path,
+                        ReadOptions {
+                            header_rows: header_rows.clone(),
+                            preview: true,
+                        },
+                    ),
+                }
             })
             .map_err(|_| "读取过程发生内部错误（已中止）".to_owned())
             .and_then(|r| r.map_err(|e| format!("{e}")));
@@ -586,6 +753,7 @@ impl ExcelLookupApp {
                 generation,
                 path,
                 header_rows,
+                sheet_idx,
                 result,
             });
             // 唤醒主线程处理结果(后台完成时 UI 可能空闲无重绘)
@@ -601,6 +769,7 @@ impl ExcelLookupApp {
         generation: u64,
         path: PathBuf,
         header_rows: Vec<Option<usize>>,
+        sheet_idx: Option<usize>,
         result: Result<Vec<SheetTable>, String>,
     ) {
         if generation != self.load_gen[side.index()] {
@@ -617,33 +786,55 @@ impl ExcelLookupApp {
             src.error = None;
             match result {
                 Ok(sheets) => {
-                    if sheets.is_empty() {
-                        src.error = Some("工作簿中无工作表".into());
-                        return;
-                    }
-                    let same_workbook = src.path.as_deref() == Some(path.as_path());
-                    let prev_sheet_idx = src.sheet_idx;
-                    // 先取旧选择再覆盖,用于判断列含义是否变了
-                    let mut prev_header_rows = std::mem::take(&mut src.header_rows);
-                    let mut requested = header_rows;
-                    // 按新工作表数对齐(缺项 = 自动)
-                    requested.resize(sheets.len(), None);
-                    prev_header_rows.resize(sheets.len(), None);
-                    // 同一文件 + 各表列名行选择未变 → 列含义不变,保留键列/输出列
-                    reset = !same_workbook || prev_header_rows != requested;
-                    src.path = Some(path);
-                    src.sheets = sheets.into_iter().map(LoadedSheet::from).collect();
-                    src.header_rows = requested;
-                    if same_workbook && prev_sheet_idx < src.sheets.len() {
-                        // 同文件重读(改列名行):停在原工作表
-                        src.sheet_idx = prev_sheet_idx;
+                    if let Some(sheet_idx) = sheet_idx {
+                        // 改列名行的请求只返回一个表,其余已加载表保持原 Arc 不动。
+                        let Some(sheet) = sheets.into_iter().next() else {
+                            src.error = Some("读取工作表后没有数据".into());
+                            return;
+                        };
+                        let same_workbook = src.path.as_deref() == Some(path.as_path());
+                        if !same_workbook || sheet_idx >= src.sheets.len() {
+                            src.error = Some("工作簿状态已变化，请重新选择工作簿".into());
+                            return;
+                        }
+                        let sheet_count = src.sheets.len();
+                        // 先取旧选择再覆盖,用于判断列含义是否变了
+                        let mut prev_header_rows = std::mem::take(&mut src.header_rows);
+                        let mut requested = header_rows;
+                        requested.resize(sheet_count, None);
+                        prev_header_rows.resize(sheet_count, None);
+                        reset = prev_header_rows != requested;
+                        src.header_rows = requested;
+                        src.sheets[sheet_idx] = LoadedSheet::from(sheet);
                     } else {
-                        // 跳到第一个非空 sheet
-                        src.sheet_idx = src
-                            .sheets
-                            .iter()
-                            .position(|s| !s.table.is_empty())
-                            .unwrap_or(0);
+                        if sheets.is_empty() {
+                            src.error = Some("工作簿中无工作表".into());
+                            return;
+                        }
+                        let same_workbook = src.path.as_deref() == Some(path.as_path());
+                        let prev_sheet_idx = src.sheet_idx;
+                        // 先取旧选择再覆盖,用于判断列含义是否变了
+                        let mut prev_header_rows = std::mem::take(&mut src.header_rows);
+                        let mut requested = header_rows;
+                        // 按新工作表数对齐(缺项 = 自动)
+                        requested.resize(sheets.len(), None);
+                        prev_header_rows.resize(sheets.len(), None);
+                        // 同一文件 + 各表列名行选择未变 → 列含义不变,保留键列/输出列
+                        reset = !same_workbook || prev_header_rows != requested;
+                        src.path = Some(path);
+                        src.sheets = sheets.into_iter().map(LoadedSheet::from).collect();
+                        src.header_rows = requested;
+                        if same_workbook && prev_sheet_idx < src.sheets.len() {
+                            // 同文件重读(改列名行):停在原工作表
+                            src.sheet_idx = prev_sheet_idx;
+                        } else {
+                            // 跳到第一个非空 sheet
+                            src.sheet_idx = src
+                                .sheets
+                                .iter()
+                                .position(|s| !s.table.is_empty())
+                                .unwrap_or(0);
+                        }
                     }
                 }
                 Err(e) => {
@@ -1024,6 +1215,7 @@ impl eframe::App for ExcelLookupApp {
                 msg.generation,
                 msg.path,
                 msg.header_rows,
+                msg.sheet_idx,
                 msg.result,
             );
         }
@@ -1887,7 +2079,7 @@ impl ExcelLookupApp {
         if picked == current {
             return;
         }
-        // 只改当前工作表的选择,其余工作表沿用各自的设置;一次重读整个工作簿
+        // 只改当前工作表的选择;优先复用顶部候选行缓存,否则只重读当前工作表。
         let (path, mut header_rows) = match side {
             Side::Left => (self.left.path.clone(), self.left.header_rows.clone()),
             Side::Right => (self.right.path.clone(), self.right.header_rows.clone()),
@@ -1901,7 +2093,7 @@ impl ExcelLookupApp {
         }
         header_rows[idx] = picked;
         if let Some(path) = path {
-            self.start_load(side, path, header_rows, ui.ctx().clone());
+            self.start_sheet_reload(side, path, header_rows, idx, ui.ctx().clone());
         }
     }
 
@@ -1941,6 +2133,23 @@ impl ExcelLookupApp {
             }
         }
         out
+    }
+
+    fn headers_from_preview(row: &[String], width: usize) -> Vec<String> {
+        let mut headers: Vec<String> = row.iter().take(width).cloned().collect();
+        headers.resize(width, String::new());
+        let mut seen = std::collections::HashMap::new();
+        for (index, header) in headers.iter_mut().enumerate() {
+            if header.trim().is_empty() {
+                *header = format!("列{}", index + 1);
+            }
+            let count = seen.entry(header.clone()).or_insert(0usize);
+            if *count > 0 {
+                *header = format!("{}_{}", header, *count + 1);
+            }
+            *count += 1;
+        }
+        headers
     }
 
     // ---------- 第二步:连接配置 ----------
