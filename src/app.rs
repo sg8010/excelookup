@@ -2886,8 +2886,9 @@ fn install_cjk_font(ctx: &egui::Context) {
         ]
     } else {
         &[
-            ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
-            ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 0),
+            // NotoSansCJK-Regular.ttc 的 face 2 是简体中文(SC); face 0 是日文(JP)。
+            ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 2),
+            ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 2),
             ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
             ("/usr/share/fonts/wqy-microhei/wqy-microhei.ttc", 0),
         ]
