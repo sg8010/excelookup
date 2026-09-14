@@ -39,6 +39,7 @@ egui_extras = "0.36"
 calamine = "0.36"
 rust_xlsxwriter = { version = "0.99", features = ["constant_memory"] }
 anyhow = "1"
+log = "0.4"
 
 # Linux 目标不使用 rfd:它靠 XDG Desktop Portal,Portal 缺失时会回退成调用
 # `zenity` 外部进程,精简桌面/无桌面环境上会直接没反应。Linux 改用内置的 egui

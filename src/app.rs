@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke};
 use egui_extras::{Column, TableBuilder};
@@ -185,6 +186,8 @@ pub struct ExcelLookupApp {
     last_dir: Option<PathBuf>,
     /// 对调 A/B 后帧末统一处理(重置键列/输出列/结果)
     pending_swap: bool,
+    /// 启动诊断用:首帧 UI 到达后标记启动完成。
+    startup_ready: Option<Arc<AtomicBool>>,
 }
 
 /// 结果表行筛选(点击对应指标卡激活,再次点击取消)
@@ -330,6 +333,7 @@ impl Default for ExcelLookupApp {
             #[cfg(target_os = "linux")]
             last_dir: None,
             pending_swap: false,
+            startup_ready: None,
         }
     }
 }
@@ -339,6 +343,16 @@ impl ExcelLookupApp {
         install_cjk_font(&cc.egui_ctx);
         Self::configure_ui_style(&cc.egui_ctx);
         Self::default()
+    }
+
+    /// 带启动完成标记的构造入口,供二进制入口的启动 watchdog 使用。
+    pub fn new_with_startup_marker(
+        cc: &eframe::CreationContext<'_>,
+        startup_ready: Arc<AtomicBool>,
+    ) -> Self {
+        let mut app = Self::new(cc);
+        app.startup_ready = Some(startup_ready);
+        app
     }
 
     fn key_mode(&self) -> KeyMode {
@@ -1225,6 +1239,13 @@ impl eframe::App for ExcelLookupApp {
         if self.pending_swap {
             self.pending_swap = false;
             self.swap_sources();
+        }
+
+        // 放在整帧 UI 逻辑完成后,这样首帧中途发生 panic 或卡住时 watchdog
+        // 仍能报告为启动阶段故障。
+        if let Some(startup_ready) = self.startup_ready.take() {
+            startup_ready.store(true, Ordering::Release);
+            log::info!("首帧界面已显示,启动完成");
         }
     }
 }
@@ -3102,6 +3123,7 @@ fn install_cjk_font(ctx: &egui::Context) {
             ("/usr/share/fonts/wqy-microhei/wqy-microhei.ttc", 0),
         ]
     };
+    let mut loaded = false;
     for &(path, face_index) in candidates {
         if let Ok(bytes) = std::fs::read(path) {
             let mut data = egui::FontData::from_owned(bytes);
@@ -3119,8 +3141,13 @@ fn install_cjk_font(ctx: &egui::Context) {
                     family_fonts.push("system_ui".to_owned());
                 }
             }
+            loaded = true;
+            log::info!("已加载界面字体: {path} (face_index={face_index})");
             break;
         }
+    }
+    if !loaded {
+        log::warn!("未找到预设 CJK 字体,将使用 egui 默认字体");
     }
     ctx.set_fonts(fonts);
 }

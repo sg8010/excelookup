@@ -3,11 +3,14 @@
 mod app;
 #[cfg(target_os = "linux")]
 mod file_dialog;
+mod startup;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use app::ExcelLookupApp;
 use eframe::egui;
+use startup::StartupDiagnostics;
 
 /// 程序图标(窗口 / 任务栏)。读取 assets/icon.png,失败时退化为默认图标。
 fn app_icon() -> Option<Arc<egui::IconData>> {
@@ -21,7 +24,12 @@ fn app_icon() -> Option<Arc<egui::IconData>> {
     }
 }
 
-fn main() -> eframe::Result {
+fn main() {
+    let diagnostics = StartupDiagnostics::begin();
+    let startup_ready = Arc::new(AtomicBool::new(false));
+    diagnostics.install_panic_hook(&startup_ready);
+    diagnostics.spawn_watchdog(Arc::clone(&startup_ready));
+
     let mut viewport = egui::ViewportBuilder::default()
         // 保持产品原有的最小工作区,仅通过操作区自适应布局解决按钮截断问题。
         .with_inner_size([1440.0, 900.0])
@@ -34,9 +42,23 @@ fn main() -> eframe::Result {
         viewport,
         ..Default::default()
     };
-    eframe::run_native(
+    diagnostics.write_line("开始创建 eframe 窗口和 OpenGL 上下文");
+    let result = eframe::run_native(
         "ExcelLookup",
         options,
-        Box::new(|cc| Ok(Box::new(ExcelLookupApp::new(cc)))),
-    )
+        Box::new({
+            let startup_ready = Arc::clone(&startup_ready);
+            move |cc| {
+                Ok(Box::new(ExcelLookupApp::new_with_startup_marker(
+                    cc,
+                    startup_ready,
+                )))
+            }
+        }),
+    );
+    diagnostics.write_line("eframe 窗口事件循环已返回");
+    if let Err(error) = result {
+        diagnostics.report_failure(&error.to_string());
+        std::process::exit(1);
+    }
 }

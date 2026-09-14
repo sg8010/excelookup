@@ -45,6 +45,22 @@ chmod +x excelookup-linux-arm64
 ./excelookup-linux-arm64
 ```
 
+### 启动失败排查
+
+程序启动时会检查桌面显示环境和图形运行库。若窗口无法创建,会直接提示底层错误,
+并把 eframe / OpenGL 初始化日志写入：
+
+```text
+~/.cache/excelookup/startup.log
+```
+
+如果系统设置了 `XDG_STATE_HOME`,日志位于
+`$XDG_STATE_HOME/excelookup/startup.log`。日志中包含程序架构、UOS/内核版本、
+`DISPLAY` 等桌面环境变量以及 X11/OpenGL 动态库探测结果,反馈问题时请一并提供该文件。
+
+Linux 图形版需要 X11 和 OpenGL/EGL 运行库;不同 UOS 设备的显卡驱动和运行库可能不同,
+所以“系统版本相同”不代表运行环境完全相同。
+
 ## 使用
 
 1. **数据源 A(主表)** → 选择文件;多 Sheet 文件可再选「工作表」,表头不在首行时改「列名行」
