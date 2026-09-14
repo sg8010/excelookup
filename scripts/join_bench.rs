@@ -10,7 +10,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use excelookup_lib::join::{JoinSpec, JoinType, KeyMode, join_with_limit};
+use excelookup_lib::join::{join_with_limit, JoinResult, JoinSpec, JoinType, KeyMode};
 use excelookup_lib::model::{CellValue, Table};
 
 struct CountingAllocator;
@@ -280,6 +280,61 @@ fn milliseconds(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+#[cfg(benchmark_baseline)]
+fn assert_output_row(
+    result: &JoinResult,
+    _left: &Table,
+    right: &Table,
+    output: usize,
+    row: &[CellValue],
+    right_row: Option<usize>,
+    case: Case,
+) {
+    assert_eq!(&result.table.rows[output][..case.width], row);
+    match right_row {
+        Some(right_row) => {
+            assert_eq!(&result.table.rows[output][case.width..], &right.rows[right_row][1..]);
+        }
+        None => assert!(
+            result.table.rows[output][case.width..]
+                .iter()
+                .all(|v| *v == CellValue::Empty)
+        ),
+    }
+}
+
+#[cfg(not(benchmark_baseline))]
+fn assert_output_row(
+    result: &JoinResult,
+    left: &Table,
+    right: &Table,
+    output: usize,
+    row: &[CellValue],
+    right_row: Option<usize>,
+    case: Case,
+) {
+    for (column, expected) in row.iter().enumerate().take(case.width) {
+        let actual = result
+            .table
+            .cell(left, right, output, column)
+            .cloned()
+            .unwrap_or(CellValue::Empty);
+        assert_eq!(&actual, expected);
+    }
+    for column in 1..case.width {
+        let expected = right_row
+            .map(|right_row| &right.rows[right_row][column])
+            .cloned()
+            .unwrap_or(CellValue::Empty);
+        let actual = result
+            .table
+            .cell(left, right, output, case.width + column - 1)
+            .cloned()
+            .unwrap_or(CellValue::Empty);
+        assert_eq!(&actual, &expected);
+    }
+}
+
 fn run_case(case: Case) {
     eprintln!(
         "正在生成 {}（A={}，B={}）",
@@ -343,22 +398,13 @@ fn run_case(case: Case) {
                 let indices = (i % distinct..right.rows.len()).step_by(distinct);
                 for ri in indices.take(if case.expand_dup { usize::MAX } else { 1 }) {
                     assert!(result.row_hit[output]);
-                    assert_eq!(&result.table.rows[output][..case.width], row);
-                    assert_eq!(
-                        &result.table.rows[output][case.width..],
-                        &right.rows[ri][1..]
-                    );
+                    assert_output_row(result, &left, &right, output, row, Some(ri), case);
                     used[ri] = true;
                     output += 1;
                 }
             } else if case.join_type == JoinType::Left {
                 assert!(!result.row_hit[output]);
-                assert_eq!(&result.table.rows[output][..case.width], row);
-                assert!(
-                    result.table.rows[output][case.width..]
-                        .iter()
-                        .all(|v| *v == CellValue::Empty)
-                );
+                assert_output_row(result, &left, &right, output, row, None, case);
                 output += 1;
             }
         }

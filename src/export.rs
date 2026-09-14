@@ -1,10 +1,12 @@
-//! 用 rust_xlsxwriter 把 Table 导出为 .xlsx(带简单样式:表头加粗、冻结首行)
+//! 用 rust_xlsxwriter 把 Table 或 Join 结果视图导出为 .xlsx
+//! (带简单样式:表头加粗、冻结首行)
 
 use anyhow::{Context, Result};
 use std::path::Path;
 
 use rust_xlsxwriter::{Format, Workbook};
 
+use crate::join::JoinedTable;
 use crate::model::{CellValue, Table};
 
 /// 导出阶段。写入阶段可以按行报告进度,保存阶段由 xlsx 打包器统一完成。
@@ -41,6 +43,80 @@ pub fn write_xlsx_with_progress(
     path: &Path,
     mut on_progress: impl FnMut(ExportProgress),
 ) -> Result<()> {
+    write_export_with_progress(table, path, &mut on_progress)
+}
+
+/// 导出基于源表行引用的 Join 结果,不先物化完整结果表。
+pub fn write_joined_xlsx(
+    table: &JoinedTable,
+    left: &Table,
+    right: &Table,
+    path: &Path,
+) -> Result<()> {
+    write_joined_xlsx_with_progress(table, left, right, path, |_| {})
+}
+
+/// 导出基于源表行引用的 Join 结果,并按阶段报告进度。
+pub fn write_joined_xlsx_with_progress(
+    table: &JoinedTable,
+    left: &Table,
+    right: &Table,
+    path: &Path,
+    mut on_progress: impl FnMut(ExportProgress),
+) -> Result<()> {
+    let source = JoinedExport {
+        table,
+        left,
+        right,
+    };
+    write_export_with_progress(&source, path, &mut on_progress)
+}
+
+trait ExportSource {
+    fn headers(&self) -> &[String];
+    fn row_count(&self) -> usize;
+    fn cell(&self, row: usize, column: usize) -> Option<&CellValue>;
+}
+
+impl ExportSource for Table {
+    fn headers(&self) -> &[String] {
+        &self.headers
+    }
+
+    fn row_count(&self) -> usize {
+        self.row_count()
+    }
+
+    fn cell(&self, row: usize, column: usize) -> Option<&CellValue> {
+        self.cell(row, column)
+    }
+}
+
+struct JoinedExport<'a> {
+    table: &'a JoinedTable,
+    left: &'a Table,
+    right: &'a Table,
+}
+
+impl ExportSource for JoinedExport<'_> {
+    fn headers(&self) -> &[String] {
+        &self.table.headers
+    }
+
+    fn row_count(&self) -> usize {
+        self.table.row_count()
+    }
+
+    fn cell(&self, row: usize, column: usize) -> Option<&CellValue> {
+        self.table.cell(self.left, self.right, row, column)
+    }
+}
+
+fn write_export_with_progress(
+    source: &impl ExportSource,
+    path: &Path,
+    on_progress: &mut impl FnMut(ExportProgress),
+) -> Result<()> {
     let mut workbook = Workbook::new();
     let sheet = workbook.add_worksheet_with_constant_memory();
 
@@ -50,8 +126,8 @@ pub fn write_xlsx_with_progress(
         .set_background_color("DDEBF7")
         .set_border(rust_xlsxwriter::FormatBorder::Thin);
     // 自适应列宽只采样前若干行,不再对大表的每个单元格生成 display String。
-    let widths = estimate_column_widths(table);
-    let total_rows = table.rows.len();
+    let widths = estimate_column_widths(source);
+    let total_rows = source.row_count();
 
     on_progress(ExportProgress {
         phase: ExportPhase::Writing,
@@ -60,25 +136,25 @@ pub fn write_xlsx_with_progress(
     });
 
     // 写表头
-    for (c, h) in table.headers.iter().enumerate() {
+    for (c, h) in source.headers().iter().enumerate() {
         sheet
             .write_string_with_format(0, c as u16, h, &header_fmt)
             .with_context(|| format!("写表头 {h} 失败"))?;
     }
 
     // 写数据
-    for (r, row) in table.rows.iter().enumerate() {
+    for r in 0..total_rows {
         let row_i = u32::try_from(r + 1).context("导出行号超出 Excel 限制")?;
-        for (c, cell) in row.iter().enumerate().take(widths.len()) {
+        for c in 0..widths.len() {
             let col = c as u16;
-            match cell {
-                CellValue::Number(n) => {
+            match source.cell(r, c) {
+                Some(CellValue::Number(n)) => {
                     sheet.write_number(row_i, col, *n)?;
                 }
-                CellValue::Text(s) => {
+                Some(CellValue::Text(s)) => {
                     sheet.write_string(row_i, col, s)?;
                 }
-                CellValue::Empty => {}
+                Some(CellValue::Empty) | None => {}
             }
         }
         let completed_rows = r + 1;
@@ -113,16 +189,19 @@ pub fn write_xlsx_with_progress(
 /// 估算一列在 Excel 中的显示宽度。只检查前 4096 行,并把结果限制在 40。
 /// 文本直接借用原字符串计算,数字只在采样行中格式化,因此不会为全表创建
 /// 临时展示字符串。
-fn estimate_column_widths(table: &Table) -> Vec<usize> {
-    let mut widths: Vec<usize> = table
-        .headers
+fn estimate_column_widths(source: &impl ExportSource) -> Vec<usize> {
+    let mut widths: Vec<usize> = source
+        .headers()
         .iter()
         .map(|header| display_width(header).min(MAX_COLUMN_WIDTH))
         .collect();
 
-    for row in table.rows.iter().take(COLUMN_WIDTH_SAMPLE_ROWS) {
-        for (column, cell) in row.iter().enumerate().take(widths.len()) {
-            widths[column] = widths[column].max(cell_display_width(cell).min(MAX_COLUMN_WIDTH));
+    for row in 0..source.row_count().min(COLUMN_WIDTH_SAMPLE_ROWS) {
+        for column in 0..widths.len() {
+            if let Some(cell) = source.cell(row, column) {
+                widths[column] =
+                    widths[column].max(cell_display_width(cell).min(MAX_COLUMN_WIDTH));
+            }
         }
         if widths.iter().all(|width| *width >= MAX_COLUMN_WIDTH) {
             break;
