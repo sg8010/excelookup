@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use crate::model::{CellValue, Table};
 
+static EMPTY_CELL: CellValue = CellValue::Empty;
+
 /// join 类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinType {
@@ -88,11 +90,100 @@ pub struct JoinSpec {
     pub expand_dup: bool,
 }
 
+/// Join 结果中的一行引用。
+///
+/// 结果不再复制 A/B 的单元格,而是记录输出行对应的源数据行。`right_row = None`
+/// 表示左连接未命中,输出的 B 字段按空值处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinedRow {
+    pub left_row: usize,
+    pub right_row: Option<usize>,
+}
+
+/// 基于源表行号的 Join 结果视图。
+///
+/// `headers` 和列映射很小;真正的数据仍保存在传入 Join 的 A/B 表中。调用方需要
+/// 在视图存活期间保留这两张源表,并通过 [`JoinedTable::cell`] 读取单元格。
+#[derive(Debug, Clone, Default)]
+pub struct JoinedTable {
+    /// 输出列名:左表全部列 + B 表选中的列。
+    pub headers: Vec<String>,
+    /// 每个输出行对应的 A/B 源行号。
+    pub rows: Vec<JoinedRow>,
+    /// A 表在输出中的列数。
+    pub left_width: usize,
+    /// 输出中每个 B 列对应的源列号,顺序与 headers 的右半部分一致。
+    pub right_pick: Vec<usize>,
+}
+
+impl JoinedTable {
+    pub fn col_count(&self) -> usize {
+        self.headers.len()
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// 读取输出视图中的单元格。
+    ///
+    /// 未命中的 B 单元格返回 `Some(CellValue::Empty)`,保持与物化结果的语义一致;
+    /// 源表中本身的空单元格也会返回 `Some(CellValue::Empty)`。
+    pub fn cell<'a>(
+        &self,
+        left: &'a Table,
+        right: &'a Table,
+        row: usize,
+        column: usize,
+    ) -> Option<&'a CellValue> {
+        let joined_row = self.rows.get(row)?;
+        if column < self.left_width {
+            return Some(
+                left.rows
+                    .get(joined_row.left_row)
+                    .and_then(|source_row| source_row.get(column))
+                    .unwrap_or(&EMPTY_CELL),
+            );
+        }
+
+        let right_column = *self.right_pick.get(column - self.left_width)?;
+        let Some(right_row) = joined_row.right_row else {
+            return Some(&EMPTY_CELL);
+        };
+        Some(
+            right
+            .rows
+            .get(right_row)
+            .and_then(|source_row| source_row.get(right_column))
+            .unwrap_or(&EMPTY_CELL),
+        )
+    }
+
+    /// 按需物化为独立 Table。GUI 和大数据导出不应调用此方法,仅适合需要独立
+    /// 数据快照的调用方;它会重新产生完整结果数据。
+    pub fn materialize(&self, left: &Table, right: &Table) -> Table {
+        let mut table = Table::new(self.headers.clone());
+        table.rows.reserve(self.rows.len());
+        for row in 0..self.rows.len() {
+            let mut cells = Vec::with_capacity(self.col_count());
+            for column in 0..self.col_count() {
+                cells.push(
+                    self.cell(left, right, row, column)
+                        .cloned()
+                        .unwrap_or(CellValue::Empty),
+                );
+            }
+            table.rows.push(cells);
+        }
+        table
+    }
+}
+
 /// join 结果
 #[derive(Debug, Clone)]
 pub struct JoinResult {
-    /// 输出表:左表全部列 + 右表取值列
-    pub table: Table,
+    /// 输出视图:左表全部列 + 右表取值列,只保存源行引用。
+    pub table: JoinedTable,
     pub left_total: usize,
     pub left_matched: usize,
     pub right_total: usize,
@@ -117,8 +208,8 @@ pub struct JoinEstimate {
 
 /// Join 分阶段计时，仅供性能诊断/benchmark 使用。
 ///
-/// `preflight` 是带上限连接在真正物化前做的 A 侧预估扫描；`probe` 与
-/// `materialize` 是真正输出扫描中的两个部分。普通 `join` 不采集这些计时。
+/// `preflight` 是带上限连接在真正生成结果引用前做的 A 侧预估扫描；`probe` 与
+/// `materialize` 是真正输出引用扫描中的两个部分。普通 `join` 不采集这些计时。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JoinTimings {
     pub index: Duration,
@@ -403,27 +494,6 @@ fn add_output_rows(total: usize, additional: usize) -> usize {
     total.saturating_add(additional)
 }
 
-fn output_row(
-    left_row: &[CellValue],
-    left_width: usize,
-    right_row: Option<&[CellValue]>,
-    right_pick: &[usize],
-    output_width: usize,
-) -> Vec<CellValue> {
-    let mut output = Vec::with_capacity(output_width);
-    output.extend(left_row.iter().take(left_width).cloned());
-    output.resize(left_width, CellValue::Empty);
-    match right_row {
-        Some(right_row) => {
-            for &col in right_pick {
-                output.push(right_row.get(col).cloned().unwrap_or(CellValue::Empty));
-            }
-        }
-        None => output.resize(output_width, CellValue::Empty),
-    }
-    output
-}
-
 fn run_join(
     left: &Table,
     right: &Table,
@@ -468,13 +538,12 @@ fn run_join(
         headers.push(right.headers[col].clone());
     }
     let left_width = left.col_count();
-    let output_width = headers.len();
-    let mut out = Table::new(headers);
+    let mut joined_rows = Vec::new();
     let reserve_rows = estimated_output.or_else(|| {
         (spec.join_type == JoinType::Left && !spec.expand_dup).then_some(left.rows.len())
     });
     if let Some(rows) = reserve_rows.filter(|&rows| rows < usize::MAX) {
-        out.rows.reserve(rows);
+        joined_rows.reserve(rows);
     }
     let mut row_hit = Vec::new();
     if let Some(rows) = reserve_rows.filter(|&rows| rows < usize::MAX) {
@@ -488,7 +557,7 @@ fn run_join(
     let mut materialize_time = Duration::ZERO;
 
     // ── 左表驱动(left / inner) ──
-    for row in &left.rows {
+    for (left_index, row) in left.rows.iter().enumerate() {
         let probe_started = measure.then(Instant::now);
         let hit = if write_key(row, &spec.left_keys, spec.key_mode, &mut left_key) {
             index.lookup(&left_key)
@@ -504,28 +573,26 @@ fn run_join(
                 left_matched += 1;
                 matches.for_each_selected(spec.expand_dup, |right_index| {
                     right_used[right_index] = true;
-                    let materialize_started = measure.then(Instant::now);
-                    let row = output_row(
-                        row,
-                        left_width,
-                        right.rows.get(right_index).map(Vec::as_slice),
-                        &rp_valid,
-                        output_width,
-                    );
-                    out.push_row(row);
+                    let reference_started = measure.then(Instant::now);
+                    joined_rows.push(JoinedRow {
+                        left_row: left_index,
+                        right_row: Some(right_index),
+                    });
                     row_hit.push(true);
-                    if let Some(materialize_started) = materialize_started {
-                        materialize_time += materialize_started.elapsed();
+                    if let Some(reference_started) = reference_started {
+                        materialize_time += reference_started.elapsed();
                     }
                 });
             }
             None if spec.join_type == JoinType::Left => {
-                let materialize_started = measure.then(Instant::now);
-                let row = output_row(row, left_width, None, &rp_valid, output_width);
-                out.push_row(row);
+                let reference_started = measure.then(Instant::now);
+                joined_rows.push(JoinedRow {
+                    left_row: left_index,
+                    right_row: None,
+                });
                 row_hit.push(false);
-                if let Some(materialize_started) = materialize_started {
-                    materialize_time += materialize_started.elapsed();
+                if let Some(reference_started) = reference_started {
+                    materialize_time += reference_started.elapsed();
                 }
             }
             None => {}
@@ -537,10 +604,15 @@ fn run_join(
     timings.total = started.elapsed();
 
     let right_matched_rows = right_used.iter().filter(|&&used| used).count();
-    let out_rows = out.row_count();
+    let out_rows = joined_rows.len();
     Ok((
         JoinResult {
-            table: out,
+            table: JoinedTable {
+                headers,
+                rows: joined_rows,
+                left_width,
+                right_pick: rp_valid,
+            },
             left_total: left.rows.len(),
             left_matched,
             right_total: right.rows.len(),
@@ -611,6 +683,16 @@ mod tests {
         }
     }
 
+    fn joined_cell<'a>(
+        table: &JoinedTable,
+        left: &'a Table,
+        right: &'a Table,
+        row: usize,
+        column: usize,
+    ) -> Option<&'a CellValue> {
+        table.cell(left, right, row, column)
+    }
+
     #[test]
     fn left_join_vlookup() {
         let a = tbl(
@@ -621,9 +703,26 @@ mod tests {
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT));
         assert_eq!(r.table.headers, vec!["id", "name", "dept"]);
         assert_eq!(r.table.row_count(), 3);
-        assert_eq!(r.table.cell(0, 2), Some(&CellValue::Text("eng".into())));
-        assert_eq!(r.table.cell(1, 2), Some(&CellValue::Empty)); // bob 未匹配
-        assert_eq!(r.table.cell(2, 2), Some(&CellValue::Text("ops".into())));
+        assert_eq!(
+            r.table.rows,
+            vec![
+                JoinedRow {
+                    left_row: 0,
+                    right_row: Some(0),
+                },
+                JoinedRow {
+                    left_row: 1,
+                    right_row: None,
+                },
+                JoinedRow {
+                    left_row: 2,
+                    right_row: Some(1),
+                },
+            ]
+        );
+        assert_eq!(joined_cell(&r.table, &a, &b, 0, 2), Some(&CellValue::Text("eng".into())));
+        assert_eq!(joined_cell(&r.table, &a, &b, 1, 2), Some(&CellValue::Empty)); // bob 未匹配
+        assert_eq!(joined_cell(&r.table, &a, &b, 2, 2), Some(&CellValue::Text("ops".into())));
         assert_eq!(r.left_matched, 2);
     }
 
@@ -633,8 +732,8 @@ mod tests {
         let b = tbl(&["id", "v"], &[&["2", "x"], &["3", "y"]]);
         let r = join(&a, &b, &spec(JoinType::Inner, 0, 0, 1, KeyMode::EXACT));
         assert_eq!(r.table.row_count(), 2);
-        assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("x".into())));
-        assert_eq!(r.table.cell(1, 1), Some(&CellValue::Text("y".into())));
+        assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("x".into())));
+        assert_eq!(joined_cell(&r.table, &a, &b, 1, 1), Some(&CellValue::Text("y".into())));
         // inner:未命中行被丢弃,输出全为命中行
         assert_eq!(r.row_hit, vec![true, true]);
     }
@@ -656,8 +755,8 @@ mod tests {
         let b = tbl(&["id", "v"], &[&["1", "a"], &["1", "b"]]);
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT));
         assert_eq!(r.table.row_count(), 2);
-        assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("a".into())));
-        assert_eq!(r.table.cell(1, 1), Some(&CellValue::Text("b".into())));
+        assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("a".into())));
+        assert_eq!(joined_cell(&r.table, &a, &b, 1, 1), Some(&CellValue::Text("b".into())));
         // 展开的两行都算命中
         assert_eq!(r.row_hit, vec![true, true]);
         assert_eq!(r.left_matched, 1);
@@ -673,7 +772,7 @@ mod tests {
         sp.expand_dup = false;
         let r = join(&a, &b, &sp);
         assert_eq!(r.table.row_count(), 1);
-        assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("a".into())));
+        assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("a".into())));
         assert_eq!(r.row_hit, vec![true]);
         assert_eq!(r.right_matched_rows, 1); // 只算实际用到的一条 B
     }
@@ -794,7 +893,7 @@ mod tests {
         );
         assert_eq!(r.table.row_count(), 1);
         assert_eq!(r.table.headers, vec!["k1", "k2", "v", "w"]);
-        assert_eq!(r.table.cell(0, 3), Some(&CellValue::Text("r1".into())));
+        assert_eq!(joined_cell(&r.table, &a, &b, 0, 3), Some(&CellValue::Text("r1".into())));
     }
 
     #[test]
@@ -807,11 +906,11 @@ mod tests {
         ]);
         let r = join(&a, &tb, &spec(JoinType::Left, 0, 0, 1, KeyMode::NORMALIZE));
         assert_eq!(r.table.row_count(), 1);
-        assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("num".into())));
+        assert_eq!(joined_cell(&r.table, &a, &tb, 0, 1), Some(&CellValue::Text("num".into())));
 
         // Exact 下数字 123 ≠ 文本 "123"
         let r2 = join(&a, &tb, &spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT));
-        assert_eq!(r2.table.cell(0, 1), Some(&CellValue::Empty));
+        assert_eq!(joined_cell(&r2.table, &a, &tb, 0, 1), Some(&CellValue::Empty));
     }
 
     #[test]
@@ -823,7 +922,7 @@ mod tests {
             CellValue::Text("number".into()),
         ]);
         let result = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::NORMALIZE));
-        assert_eq!(result.table.cell(0, 1), Some(&CellValue::Empty));
+        assert_eq!(joined_cell(&result.table, &a, &b, 0, 1), Some(&CellValue::Empty));
     }
 
     #[test]
@@ -833,8 +932,8 @@ mod tests {
         let b = tbl(&["id", "v"], &[&["1", "x"]]);
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT));
         assert_eq!(r.table.row_count(), 2);
-        assert_eq!(r.table.cell(0, 1), Some(&CellValue::Empty));
-        assert_eq!(r.table.cell(1, 1), Some(&CellValue::Text("x".into())));
+        assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Empty));
+        assert_eq!(joined_cell(&r.table, &a, &b, 1, 1), Some(&CellValue::Text("x".into())));
     }
 
     #[test]
@@ -855,7 +954,7 @@ mod tests {
         );
         assert_eq!(r.table.headers, vec!["id", "x", "y"]);
         assert_eq!(r.table.row_count(), 1);
-        assert_eq!(r.table.cell(0, 2), Some(&CellValue::Text("20".into())));
+        assert_eq!(joined_cell(&r.table, &a, &b, 0, 2), Some(&CellValue::Text("20".into())));
     }
 
     #[test]
@@ -869,7 +968,7 @@ mod tests {
         };
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m));
         assert_eq!(r.table.row_count(), 1);
-        assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("x".into())));
+        assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("x".into())));
 
         // 关闭括号归一化则不匹配
         let m2 = KeyMode {
@@ -878,7 +977,7 @@ mod tests {
         };
         let r2 = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m2));
         assert_eq!(r2.table.row_count(), 1);
-        assert_eq!(r2.table.cell(0, 1), Some(&CellValue::Empty));
+        assert_eq!(joined_cell(&r2.table, &a, &b, 0, 1), Some(&CellValue::Empty));
     }
 
     #[test]
@@ -892,7 +991,7 @@ mod tests {
         };
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m));
         assert_eq!(r.table.row_count(), 1);
-        assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("hit".into())));
+        assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("hit".into())));
     }
 
     #[test]
@@ -905,7 +1004,7 @@ mod tests {
             brackets: true,
         };
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m));
-        assert_eq!(r.table.cell(0, 1), Some(&CellValue::Text("x".into())));
+        assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("x".into())));
     }
 
     #[test]
@@ -995,7 +1094,7 @@ mod tests {
             },
         );
         assert_eq!(
-            result.table.cell(0, 2),
+            joined_cell(&result.table, &a, &b, 0, 2),
             Some(&CellValue::Text("hit".into()))
         );
     }

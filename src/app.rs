@@ -7,7 +7,7 @@ use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke};
 use egui_extras::{Column, TableBuilder};
 
 use excelookup_lib::export::{ExportPhase, ExportProgress};
-use excelookup_lib::join::{join_with_limit, JoinSpec, JoinType, KeyMode};
+use excelookup_lib::join::{join_with_limit, JoinedTable, JoinSpec, JoinType, KeyMode};
 use excelookup_lib::model::{CellValue, Table};
 use excelookup_lib::read_xlsx::{ReadOptions, SheetTable};
 
@@ -39,7 +39,7 @@ enum ExportMsg {
     },
 }
 
-/// 导出状态。结果表通过 Arc 与后台线程共享,避免为导出再复制一份大表。
+/// 导出状态。Join 结果视图通过 Arc 与后台线程共享,避免为导出再复制一份大表。
 #[derive(Default)]
 enum ExportState {
     #[default]
@@ -48,12 +48,39 @@ enum ExportState {
     Done,
 }
 
+/// GUI 持有的工作表快照。
+///
+/// 表格本体放在 `Arc` 中,这样 Join 结果和后台导出可以共享源数据,不必再复制
+/// 一份 A/B 表;切换或重新加载工作表时只会替换这个 Arc。
+#[derive(Default, Clone)]
+struct LoadedSheet {
+    name: String,
+    table: Arc<Table>,
+    preview: Vec<Vec<String>>,
+    auto_header_row: Option<usize>,
+    used_header_row: Option<usize>,
+    first_row_number: usize,
+}
+
+impl From<SheetTable> for LoadedSheet {
+    fn from(sheet: SheetTable) -> Self {
+        Self {
+            name: sheet.name,
+            table: Arc::new(sheet.table),
+            preview: sheet.preview,
+            auto_header_row: sheet.auto_header_row,
+            used_header_row: sheet.used_header_row,
+            first_row_number: sheet.first_row_number,
+        }
+    }
+}
+
 /// 一个已打开的数据源(文件 + sheets)
 #[derive(Default, Clone)]
 struct Source {
     path: Option<PathBuf>,
     /// 所有工作表(名称 / 数据表 / 顶部预览),顺序与工作簿一致
-    sheets: Vec<SheetTable>,
+    sheets: Vec<LoadedSheet>,
     /// 当前 sheet 下标
     sheet_idx: usize,
     /// 各工作表的列名行选择(与 sheets 对齐;None = 自动)。
@@ -79,7 +106,7 @@ impl Source {
         self.sheets.iter().map(|s| s.name.clone()).collect()
     }
 
-    fn cur_sheet(&self) -> Option<&SheetTable> {
+    fn cur_sheet(&self) -> Option<&LoadedSheet> {
         self.sheets.get(self.sheet_idx)
     }
 
@@ -88,7 +115,7 @@ impl Source {
     }
 
     fn cur_table(&self) -> Option<&Table> {
-        self.cur_sheet().map(|s| &s.table)
+        self.cur_sheet().map(|s| s.table.as_ref())
     }
 
     fn cur_col_count(&self) -> usize {
@@ -161,7 +188,11 @@ enum RowFilter {
 }
 
 struct JoinOutcome {
-    table: Arc<Table>,
+    /// 只保存源行引用的结果视图,不拥有一份物化结果数据。
+    table: Arc<JoinedTable>,
+    /// 结果视图依赖的 A/B 源表快照。
+    left_source: Arc<Table>,
+    right_source: Arc<Table>,
     left_matched: usize,
     left_total: usize,
     right_matched_rows: usize,
@@ -323,16 +354,22 @@ impl ExcelLookupApp {
         matches!(self.export_state, ExportState::Running(_))
     }
 
-    /// 启动后台导出。结果表只通过 Arc 共享,不会因导出再复制一整张大表。
+    /// 启动后台导出。结果视图与 A/B 源表都只通过 Arc 共享,不会因导出再复制大表。
     fn start_export(&mut self, path: PathBuf, ctx: egui::Context) {
         if self.export_active() {
             return;
         }
-        let Some(table) = self
+        let Some((table, left_source, right_source)) = self
             .result
             .as_ref()
             .filter(|result| result.err.is_none() && result.table.col_count() > 0)
-            .map(|result| Arc::clone(&result.table))
+            .map(|result| {
+                (
+                    Arc::clone(&result.table),
+                    Arc::clone(&result.left_source),
+                    Arc::clone(&result.right_source),
+                )
+            })
         else {
             return;
         };
@@ -352,8 +389,10 @@ impl ExcelLookupApp {
         let repaint_ctx = ctx.clone();
         std::thread::spawn(move || {
             let export_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                excelookup_lib::export::write_xlsx_with_progress(
+                excelookup_lib::export::write_joined_xlsx_with_progress(
                     &table,
+                    &left_source,
+                    &right_source,
                     &path,
                     |progress| {
                         let _ = tx.send(ExportMsg::Progress {
@@ -583,7 +622,7 @@ impl ExcelLookupApp {
                     // 同一文件 + 各表列名行选择未变 → 列含义不变,保留键列/输出列
                     reset = !same_workbook || prev_header_rows != requested;
                     src.path = Some(path);
-                    src.sheets = sheets;
+                    src.sheets = sheets.into_iter().map(LoadedSheet::from).collect();
                     src.header_rows = requested;
                     if same_workbook && prev_sheet_idx < src.sheets.len() {
                         // 同文件重读(改列名行):停在原工作表
@@ -648,7 +687,9 @@ impl ExcelLookupApp {
         self.invalidate_export();
         if !self.left.is_loaded() || !self.right.is_loaded() {
             self.result = Some(JoinOutcome {
-                table: Arc::new(Table::default()),
+                table: Arc::new(JoinedTable::default()),
+                left_source: Arc::new(Table::default()),
+                right_source: Arc::new(Table::default()),
                 left_matched: 0,
                 left_total: 0,
                 right_matched_rows: 0,
@@ -665,18 +706,22 @@ impl ExcelLookupApp {
             return;
         }
 
-        // 当前 sheet 的借用分离:先取引用
-        let Some(left_t) = self.left.cur_table() else {
+        // 当前 sheet 只克隆 Arc,不复制表格数据;结果视图和后台导出都会共享这两个快照。
+        let Some(left_table) = self.left.cur_sheet().map(|sheet| Arc::clone(&sheet.table)) else {
             return;
         };
-        let Some(right_t) = self.right.cur_table() else {
+        let Some(right_table) = self.right.cur_sheet().map(|sheet| Arc::clone(&sheet.table)) else {
             return;
         };
+        let left_t = left_table.as_ref();
+        let right_t = right_table.as_ref();
         let lc = left_t.col_count();
         let rc = right_t.col_count();
         if lc == 0 || rc == 0 {
             self.result = Some(JoinOutcome {
-                table: Arc::new(Table::default()),
+                table: Arc::new(JoinedTable::default()),
+                left_source: Arc::new(Table::default()),
+                right_source: Arc::new(Table::default()),
                 left_matched: 0,
                 left_total: 0,
                 right_matched_rows: 0,
@@ -695,7 +740,9 @@ impl ExcelLookupApp {
         // 键列未选择或当前表无列时不允许执行
         let (Some(lk), Some(rk)) = (self.left_key_col, self.right_key_col) else {
             self.result = Some(JoinOutcome {
-                table: Arc::new(Table::default()),
+                table: Arc::new(JoinedTable::default()),
+                left_source: Arc::new(Table::default()),
+                right_source: Arc::new(Table::default()),
                 left_matched: 0,
                 left_total: 0,
                 right_matched_rows: 0,
@@ -802,7 +849,9 @@ impl ExcelLookupApp {
                 lines.push("4. 若确认键列无误仍过大,可先对 A 表筛选/去重后再连接。".into());
 
                 self.result = Some(JoinOutcome {
-                    table: Arc::new(Table::default()),
+                    table: Arc::new(JoinedTable::default()),
+                    left_source: Arc::new(Table::default()),
+                    right_source: Arc::new(Table::default()),
                     left_matched: 0,
                     left_total: 0,
                     right_matched_rows: 0,
@@ -822,6 +871,8 @@ impl ExcelLookupApp {
         let matched_rows = res.row_hit.iter().filter(|&&h| h).count();
         self.result = Some(JoinOutcome {
             table: Arc::new(res.table),
+            left_source: left_table,
+            right_source: right_table,
             left_matched: res.left_matched,
             left_total: res.left_total,
             right_matched_rows: res.right_matched_rows,
@@ -2463,6 +2514,8 @@ impl ExcelLookupApp {
         }
 
         let table = &result.table;
+        let left_source = &result.left_source;
+        let right_source = &result.right_source;
         let headers = table.headers.clone();
         let ncols = table.col_count();
         // 行筛选:已匹配/未命中(按 row_hit 标记过滤);None=全部
@@ -2549,7 +2602,7 @@ impl ExcelLookupApp {
                                 row.col(|ui| {
                                     // 列 clip 时单元格 wrap_mode=Truncate,Label 默认在文本
                                     // 被截断(elided)时自动弹全文 tooltip,无需手动添加。
-                                    match table.cell(index, column) {
+                                    match table.cell(left_source, right_source, index, column) {
                                         None | Some(CellValue::Empty) => {
                                             ui.label(
                                                 egui::RichText::new("—")

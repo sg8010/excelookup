@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use rust_xlsxwriter::Workbook;
 
-use excelookup_lib::export::write_xlsx;
+use excelookup_lib::export::write_joined_xlsx;
 use excelookup_lib::join::{join, JoinSpec, JoinType, KeyMode};
 use excelookup_lib::model::CellValue;
 use excelookup_lib::read_xlsx::{read_workbook, read_workbook_opts, ReadOptions};
@@ -74,12 +74,21 @@ fn end_to_end_left_join_real_xlsx() {
     assert_eq!(res.table.headers, vec!["id", "姓名", "部门"]);
     assert_eq!(res.table.row_count(), 3); // 左表全保留
     assert_eq!(res.left_matched, 2); // id 1,3 命中;2 未命中
-    assert_eq!(res.table.cell(0, 2), Some(&CellValue::Text("工程部".into())));
-    assert_eq!(res.table.cell(1, 2), Some(&CellValue::Empty)); // 李四未匹配
-    assert_eq!(res.table.cell(2, 2), Some(&CellValue::Text("产品部".into())));
+    assert_eq!(
+        res.table.cell(&left, &right, 0, 2),
+        Some(&CellValue::Text("工程部".into()))
+    );
+    assert_eq!(
+        res.table.cell(&left, &right, 1, 2),
+        Some(&CellValue::Empty)
+    ); // 李四未匹配
+    assert_eq!(
+        res.table.cell(&left, &right, 2, 2),
+        Some(&CellValue::Text("产品部".into()))
+    );
 
     // 3. 导出
-    write_xlsx(&res.table, &out).unwrap();
+    write_joined_xlsx(&res.table, &left, &right, &out).unwrap();
 
     // 4. 读回验证
     let back = read_workbook(&out).unwrap();
@@ -116,7 +125,7 @@ fn end_to_end_inner_join_real_xlsx() {
     let res = join(&left, &right, &spec);
     assert_eq!(res.table.row_count(), 2); // id 1,3 命中;2、9 被丢弃
 
-    write_xlsx(&res.table, &out).unwrap();
+    write_joined_xlsx(&res.table, &left, &right, &out).unwrap();
     let back = read_workbook(&out).unwrap();
     assert_eq!(back[0].1.row_count(), 2);
 
@@ -185,15 +194,18 @@ fn end_to_end_same_file_two_sheets() {
     assert_eq!(res.table.headers, vec!["订单号", "客户", "金额", "城市"]);
     assert_eq!(res.table.row_count(), 3); // 左表全保留
     assert_eq!(
-        res.table.cell(0, 3),
+        res.table.cell(&orders, &customers, 0, 3),
         Some(&CellValue::Text("北京".into()))
     );
     assert_eq!(
-        res.table.cell(1, 3),
+        res.table.cell(&orders, &customers, 1, 3),
         Some(&CellValue::Text("上海".into()))
     );
     // 王五未在客户表 → 城市空
-    assert_eq!(res.table.cell(2, 3), Some(&CellValue::Empty));
+    assert_eq!(
+        res.table.cell(&orders, &customers, 2, 3),
+        Some(&CellValue::Empty)
+    );
     assert_eq!(res.left_matched, 2);
 
     let _ = std::fs::remove_file(&path);
