@@ -598,7 +598,8 @@ impl FileDialog {
                                 )
                                 // 标签默认只响应 hover，会挡住表格行的点击；把点击能力
                                 // 加回标签本身，文件名文字和行内空白区域行为保持一致。
-                                .interact(egui::Sense::click());
+                                .interact(egui::Sense::click())
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
                             if response.double_clicked() {
                                 row_intent = Some(RowIntent::Activate(entry.path.clone(), is_dir));
                             } else if response.clicked() {
