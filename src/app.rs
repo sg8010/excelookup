@@ -1,6 +1,6 @@
 //! ExcelLookup 主应用界面 (egui)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke};
@@ -35,6 +35,7 @@ enum ExportMsg {
     },
     Finished {
         generation: u64,
+        path: PathBuf,
         result: std::result::Result<(), String>,
     },
 }
@@ -45,7 +46,7 @@ enum ExportState {
     #[default]
     Idle,
     Running(ExportProgress),
-    Done,
+    Done(PathBuf),
 }
 
 /// GUI 持有的工作表快照。
@@ -166,6 +167,8 @@ pub struct ExcelLookupApp {
     export_gen: u64,
     /// 当前导出状态
     export_state: ExportState,
+    /// 打开导出文件位置失败时显示的错误
+    export_location_error: Option<String>,
     /// 已点击待处理的对话框请求(帧末统一处理)
     pending_dialog: Option<DialogRequest>,
     /// 内置文件对话框(Linux;其他平台用系统原生 rfd 对话框)
@@ -314,6 +317,7 @@ impl Default for ExcelLookupApp {
             export_rx: None,
             export_gen: 0,
             export_state: ExportState::Idle,
+            export_location_error: None,
             pending_dialog: None,
             #[cfg(target_os = "linux")]
             dialog: None,
@@ -348,6 +352,7 @@ impl ExcelLookupApp {
         self.export_gen = self.export_gen.wrapping_add(1);
         self.export_rx = None;
         self.export_state = ExportState::Idle;
+        self.export_location_error = None;
     }
 
     fn export_active(&self) -> bool {
@@ -408,6 +413,7 @@ impl ExcelLookupApp {
 
             let _ = tx.send(ExportMsg::Finished {
                 generation,
+                path,
                 result: export_result,
             });
             repaint_ctx.request_repaint();
@@ -434,10 +440,14 @@ impl ExcelLookupApp {
                 } if generation == self.export_gen && self.export_active() => {
                     self.export_state = ExportState::Running(progress);
                 }
-                ExportMsg::Finished { generation, result } if generation == self.export_gen => {
+                ExportMsg::Finished {
+                    generation,
+                    path,
+                    result,
+                } if generation == self.export_gen => {
                     self.export_rx = None;
                     match result {
-                        Ok(()) => self.export_state = ExportState::Done,
+                        Ok(()) => self.export_state = ExportState::Done(path),
                         Err(error) => {
                             if let Some(result) = &mut self.result {
                                 result.err = Some(format!("导出失败: {error}"));
@@ -1775,6 +1785,7 @@ impl ExcelLookupApp {
                     })
                     .selected_text(current)
                     .width((ui.available_width() - 76.0).max(110.0))
+                    .truncate()
                     .show_ui(ui, |ui| {
                         for (index, name) in sheet_names.iter().enumerate() {
                             if ui.selectable_label(index == sheet_idx, name).clicked() {
@@ -1857,6 +1868,8 @@ impl ExcelLookupApp {
             })
             .selected_text(selected_text)
             .width((ui.available_width() - 76.0).max(110.0))
+            // 预览文本可能很长;截断选中项,不能让 ComboBox 的最小宽度撑大三列布局。
+            .truncate()
             .show_ui(ui, |ui| {
                 for (value, label) in &options {
                     ui.selectable_value(&mut picked, *value, label);
@@ -2122,6 +2135,7 @@ impl ExcelLookupApp {
         egui::ComboBox::from_id_salt(id)
             .selected_text(selected.unwrap_or_else(|| "(请选择匹配列)".to_owned()))
             .width(ui.available_width())
+            .truncate()
             .show_ui(ui, |ui| {
                 for (index, name) in headers.iter().enumerate() {
                     ui.selectable_value(sel, Some(index), name);
@@ -2455,7 +2469,7 @@ impl ExcelLookupApp {
             })
     }
 
-    fn ui_export_progress(&self, ui: &mut egui::Ui) {
+    fn ui_export_progress(&mut self, ui: &mut egui::Ui) {
         match &self.export_state {
             ExportState::Running(progress) => {
                 let (phase_label, fraction, detail) = match progress.phase {
@@ -2507,14 +2521,38 @@ impl ExcelLookupApp {
                 });
                 ui.add_space(10.0);
             }
-            ExportState::Done => {
+            ExportState::Done(path) => {
+                let path = path.clone();
+                let location_error = self.export_location_error.clone();
+                let mut open_location = false;
                 Self::card_frame(Self::surface(), Self::line(), 13).show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new("导出完成，可打开刚保存的工作簿。")
-                            .size(13.0)
-                            .color(Self::blue()),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("导出完成，可打开刚保存的工作簿。")
+                                .size(13.0)
+                                .color(Self::blue()),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if Self::secondary_button(ui, "打开文件位置", 128.0).clicked() {
+                                    open_location = true;
+                                }
+                            },
+                        );
+                    });
+                    if let Some(error) = &location_error {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(error)
+                                .size(12.0)
+                                .color(Self::amber()),
+                        );
+                    }
                 });
+                if open_location {
+                    self.export_location_error = open_export_location(&path).err();
+                }
                 ui.add_space(10.0);
             }
             ExportState::Idle => {}
@@ -2734,6 +2772,102 @@ impl ExcelLookupApp {
             style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(16.0));
             style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(29.0));
         });
+    }
+}
+
+/// 调用系统文件管理器显示已导出的文件。
+fn open_export_location(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err(format!("导出文件不存在: {}", path.display()));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let selection = format!("/select,{}", path.display());
+        std::process::Command::new("explorer.exe")
+            .arg(selection)
+            .spawn()
+            .map(|_| ())
+            .map_err(|_| "无法打开系统文件管理器".to_owned())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|_| "无法打开系统文件管理器".to_owned())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::OsString;
+        use std::process::Stdio;
+
+        fn spawn_file_manager(program: &str, args: &[OsString]) -> std::io::Result<()> {
+            std::process::Command::new(program)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map(|_| ())
+        }
+
+        let file = path.as_os_str().to_os_string();
+        // 这些文件管理器支持选中指定文件;按常见桌面环境依次尝试。
+        let selectors = [
+            (
+                "nautilus",
+                vec![OsString::from("--select"), file.clone()],
+            ),
+            (
+                "dolphin",
+                vec![OsString::from("--select"), file.clone()],
+            ),
+            ("nemo", vec![OsString::from("--select"), file.clone()]),
+            (
+                "pcmanfm-qt",
+                vec![OsString::from("--select"), file.clone()],
+            ),
+            (
+                "pcmanfm",
+                vec![OsString::from("--select"), file.clone()],
+            ),
+            ("thunar", vec![file.clone()]),
+        ];
+        for (program, args) in selectors {
+            if spawn_file_manager(program, &args).is_ok() {
+                return Ok(());
+            }
+        }
+
+        // 未知桌面环境的通用回退:至少打开新文件所在目录。
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .as_os_str()
+            .to_os_string();
+        if spawn_file_manager("xdg-open", std::slice::from_ref(&directory)).is_ok()
+            || spawn_file_manager(
+                "gio",
+                &[OsString::from("open"), directory],
+            )
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        Err("无法找到可用的系统文件管理器".to_owned())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = path;
+        Err("当前系统不支持打开文件位置".to_owned())
     }
 }
 
