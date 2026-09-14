@@ -1183,24 +1183,38 @@ impl ExcelLookupApp {
         ui.add_space(17.0);
         ui.separator();
         ui.add_space(15.0);
-        ui.horizontal(|ui| {
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                ui.painter().circle_stroke(
-                    rect.center(),
-                    5.0,
-                    Stroke::new(1.4, Self::teal()),
-                );
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(rect.center().x, rect.center().y),
-                        egui::pos2(rect.center().x + 2.5, rect.center().y + 2.0),
-                    ],
-                    Stroke::new(1.2, Self::teal()),
-                );
-                ui.label(egui::RichText::new(note).size(13.0).color(Self::muted()));
+        // 窗口较窄时让按钮逐个参与换行;宽窗口仍保持说明在左、操作在右的布局。
+        let compact = ui.available_width() < 620.0;
+        if compact {
+            ui.horizontal_wrapped(|ui| {
+                Self::action_note(ui, note);
+                ui.add_space(17.0);
+                add_buttons(ui);
             });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add_buttons);
+        } else {
+            ui.horizontal(|ui| {
+                Self::action_note(ui, note);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add_buttons);
+            });
+        }
+    }
+
+    fn action_note(ui: &mut egui::Ui, note: &str) {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+            ui.painter().circle_stroke(
+                rect.center(),
+                5.0,
+                Stroke::new(1.4, Self::teal()),
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(rect.center().x, rect.center().y),
+                    egui::pos2(rect.center().x + 2.5, rect.center().y + 2.0),
+                ],
+                Stroke::new(1.2, Self::teal()),
+            );
+            ui.label(egui::RichText::new(note).size(13.0).color(Self::muted()));
         });
     }
 
@@ -1650,7 +1664,7 @@ impl ExcelLookupApp {
 
         let can_next = self.sources_ready();
         Self::action_row(ui, "文件只在本机读取，不会上传", |ui| {
-            if Self::primary_button(ui, "下一步：配置连接  →", 152.0, can_next).clicked() {
+            if Self::primary_button(ui, "下一步：配置连接  →", 176.0, can_next).clicked() {
                 self.go_to_step(WorkflowStep::Configure);
             }
             if Self::secondary_button(ui, "清空数据源", 104.0).clicked() {

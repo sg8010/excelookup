@@ -23,8 +23,10 @@ fn app_icon() -> Option<Arc<egui::IconData>> {
 
 fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
+        // 保持产品原有的最小工作区,仅通过操作区自适应布局解决按钮截断问题。
         .with_inner_size([1440.0, 900.0])
-        .with_min_inner_size([1440.0, 900.0]);
+        .with_min_inner_size([1440.0, 900.0])
+        .with_clamp_size_to_monitor_size(true);
     if let Some(icon) = app_icon() {
         viewport = viewport.with_icon(icon);
     }

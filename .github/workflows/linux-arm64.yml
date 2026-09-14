@@ -18,6 +18,9 @@ jobs:
       image: debian:buster
     steps:
       - uses: actions/checkout@v4
+        with:
+          # build.rs 需要标签来写入应用内版本号;不要使用默认的浅克隆。
+          fetch-depth: 0
 
       - name: 切到 archive 源 (buster 已 EOL)
         run: |
@@ -31,7 +34,7 @@ jobs:
       - name: 装 rustup + gcc
         run: |
           apt-get install -y --no-install-recommends \
-            curl ca-certificates gcc libc6-dev dpkg-dev desktop-file-utils
+            curl ca-certificates git gcc libc6-dev dpkg-dev desktop-file-utils
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 

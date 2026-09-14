@@ -4,12 +4,16 @@
 use std::{path::PathBuf, process::Command};
 
 fn main() {
-    // 发布版本以 Git 标签为准；没有 Git 信息时回退到 Cargo.toml 版本。
+    // 发布版本优先取 GitHub 标签,其次取本地 Git 标签;没有 Git 信息时回退到
+    // Cargo.toml 版本。CI 容器即使只有源码归档,也能通过 GITHUB_REF_NAME 带入版本。
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/packed-refs");
     println!("cargo:rerun-if-changed=.git/refs/tags");
-    let version = git_version().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+    let version = github_version()
+        .or_else(git_version)
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
     println!("cargo:rustc-env=EXCELOOKUP_VERSION={version}");
 
     // 只在 Windows 目标嵌入图标(交叉编译 target=x86_64-pc-windows-gnu 也适用)
@@ -76,4 +80,11 @@ fn git_version() -> Option<String> {
     let tag = String::from_utf8(output.stdout).ok()?;
     let version = tag.trim().strip_prefix('v')?;
     (!version.is_empty()).then(|| version.to_owned())
+}
+
+fn github_version() -> Option<String> {
+    let tag = std::env::var("GITHUB_REF_NAME").ok()?;
+    let version = tag.strip_prefix('v')?;
+    (!version.is_empty() && version.chars().next()?.is_ascii_digit())
+        .then(|| version.to_owned())
 }
