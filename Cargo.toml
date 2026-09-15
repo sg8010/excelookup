@@ -46,6 +46,10 @@ lto = "fat"
 # 图形 API 顺序改为 EGL 优先、GLX 兜底；详见 vendor/glutin-winit/EXCELOOKUP_PATCH.md。
 [patch.crates-io]
 glutin-winit = { path = "vendor/glutin-winit" }
+# windows-sys 0.61 把 CoTaskMemFree 改为从 combase.dll 导入,而 Windows 7
+# 只在 ole32.dll 提供这个兼容 API。保留 windows-sys 的声明,仅替换链接宏
+# 对该函数的 DLL,避免 x86/x64 的 Win7 产物在启动时加载不存在的 combase.dll。
+windows-link = { path = "vendor/windows-link" }
 
 [dependencies]
 # Linux 目标仅需 X11 + glow(OpenGL) 渲染;关 default 去掉 wayland/wgpu/accesskit。

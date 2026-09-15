@@ -27,6 +27,7 @@ IMPORTS=$("$OBJDUMP" -p "$EXE")
 # PathCchStripPrefix：arboard 的文件列表剪贴板代码会引用它，但本应用
 # 不使用该接口，release fat LTO 应将这段未使用代码删除。
 for forbidden in \
+    "combase.dll" \
     "PathCchStripPrefix" \
     "api-ms-win-core-path-l1-1-0.dll" \
     "WaitOnAddress" \
