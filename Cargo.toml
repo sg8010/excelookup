@@ -41,8 +41,15 @@ assets = [
 # Windows 8 才提供的 PathCchStripPrefix；同时也让最终导入表更容易审计。
 lto = "fat"
 
+# eframe 0.36 固定优先使用 GLX。UOS 20 的旧 Mesa 18.3.6 会在该路径异步
+# 返回 GLXBadContextTag，导致 winit 显示首窗时崩溃。项目补丁只把 Linux 的
+# 图形 API 顺序改为 EGL 优先、GLX 兜底；详见 vendor/glutin-winit/EXCELOOKUP_PATCH.md。
+[patch.crates-io]
+glutin-winit = { path = "vendor/glutin-winit" }
+
 [dependencies]
 # Linux 目标仅需 X11 + glow(OpenGL) 渲染;关 default 去掉 wayland/wgpu/accesskit。
+# 本地 glutin-winit 补丁会让 Linux 上的 glow 优先通过 EGL 创建上下文。
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "links", "glow", "x11"] }
 egui_extras = "0.36"
 calamine = "0.36"
