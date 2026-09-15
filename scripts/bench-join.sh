@@ -16,6 +16,17 @@ uname -a >> "$bench_dir/environment.txt"
 lscpu >> "$bench_dir/environment.txt"
 git rev-parse HEAD >> "$bench_dir/environment.txt"
 printf 'baseline_source=%s\n' "$baseline_source" >> "$bench_dir/environment.txt"
+# src/join.rs 依赖 foldhash crate；本脚本绕开 cargo 用 rustc 直编，需先让
+# cargo 产出 foldhash rlib，编译 current 一侧时显式 --extern。baseline 快照
+# 是 foldhash 之前的旧实现，无此依赖。
+cargo build --release --package foldhash >/dev/null
+foldhash_dir="${CARGO_TARGET_DIR:-$PWD/target}/release/deps"
+foldhash_rlib=$(ls -t "$foldhash_dir"/libfoldhash-*.rlib 2>/dev/null | head -1)
+[[ -n "$foldhash_rlib" && -f "$foldhash_rlib" ]] || {
+  echo "未找到 foldhash rlib：cargo build --release --package foldhash 未产出" >&2
+  exit 1
+}
+printf 'foldhash_rlib=%s\n' "$foldhash_rlib" >> "$bench_dir/environment.txt"
 for version in baseline current; do
   mkdir -p "$bench_dir/$version"
   for source in join model; do
@@ -29,14 +40,22 @@ for version in baseline current; do
 pub mod join;
 pub mod model;
 RS
+  # current 的 join.rs 依赖 foldhash：编译 rlib 时显式 --extern；编译 driver 时
+  # rustc 读 rlib 元数据还要能定位 foldhash，经 -L dependency 搜索路径提供。
+  lib_externs=()
+  dep_flags=()
+  if [[ $version == current ]]; then
+    lib_externs+=(--extern "foldhash=$foldhash_rlib")
+    dep_flags+=(-L "dependency=$foldhash_dir")
+  fi
   rustc --edition=2024 -O --crate-name excelookup_lib --crate-type rlib \
-    "$bench_dir/$version/lib.rs" -o "$bench_dir/$version/libexcelookup_lib.rlib"
+    "${lib_externs[@]}" "$bench_dir/$version/lib.rs" -o "$bench_dir/$version/libexcelookup_lib.rlib"
   config=()
   if [[ $version == baseline ]]; then config+=(--cfg benchmark_baseline); fi
   for mode in timing allocations; do
     counts=()
     if [[ $mode == allocations ]]; then counts+=(--cfg count_allocations); fi
-    rustc --edition=2024 -O -A dead_code "${config[@]}" "${counts[@]}" \
+    rustc --edition=2024 -O -A dead_code "${config[@]}" "${counts[@]}" "${dep_flags[@]}" \
       "$bench_dir/driver.rs" --extern "excelookup_lib=$bench_dir/$version/libexcelookup_lib.rlib" \
       -o "$bench_dir/$version/$mode"
   done

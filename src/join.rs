@@ -9,6 +9,11 @@ use std::collections::{HashMap, hash_map::Entry};
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
+// B 索引每行插一次、A 表每行查一次,百万行规模下哈希本身占 join 耗时可观。
+// SipHash 为抗 HashDoS 而设计,读本地 Excel 文件用不到这层防护,改用 hashbrown
+// 默认的 foldhash。map 迭代顺序会变,但输出顺序由 A 表行序决定,不依赖迭代。
+use foldhash::fast::RandomState;
+
 use crate::model::{CellValue, Table};
 
 static EMPTY_CELL: CellValue = CellValue::Empty;
@@ -90,14 +95,21 @@ pub struct JoinSpec {
     pub expand_dup: bool,
 }
 
+/// `JoinedRow::right_row` 的未命中哨兵。
+///
+/// Excel 单表最多 1,048,576 行,`u32` 足够表示源行号;用哨兵而不是
+/// `Option<u32>` 是为了让 `JoinedRow` 保持 8 字节——结果行数可达 500 万,
+/// 每行 4 字节的差距就是 20MB。
+pub const UNMATCHED_RIGHT_ROW: u32 = u32::MAX;
+
 /// Join 结果中的一行引用。
 ///
-/// 结果不再复制 A/B 的单元格,而是记录输出行对应的源数据行。`right_row = None`
-/// 表示左连接未命中,输出的 B 字段按空值处理。
+/// 结果不再复制 A/B 的单元格,而是记录输出行对应的源数据行。`right_row` 等于
+/// [`UNMATCHED_RIGHT_ROW`] 表示左连接未命中,输出的 B 字段按空值处理。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JoinedRow {
-    pub left_row: usize,
-    pub right_row: Option<usize>,
+    pub left_row: u32,
+    pub right_row: u32,
 }
 
 /// 基于源表行号的 Join 结果视图。
@@ -125,6 +137,14 @@ impl JoinedTable {
         self.rows.len()
     }
 
+    /// 该输出行是否命中。左连接未命中的 A 行(右侧补空)为 false,内连接全为
+    /// true;重复键展开出的多行都算命中。
+    pub fn row_hit(&self, row: usize) -> bool {
+        self.rows
+            .get(row)
+            .is_some_and(|joined_row| joined_row.right_row != UNMATCHED_RIGHT_ROW)
+    }
+
     /// 读取输出视图中的单元格。
     ///
     /// 未命中的 B 单元格返回 `Some(CellValue::Empty)`,保持与物化结果的语义一致;
@@ -140,22 +160,22 @@ impl JoinedTable {
         if column < self.left_width {
             return Some(
                 left.rows
-                    .get(joined_row.left_row)
+                    .get(joined_row.left_row as usize)
                     .and_then(|source_row| source_row.get(column))
                     .unwrap_or(&EMPTY_CELL),
             );
         }
 
         let right_column = *self.right_pick.get(column - self.left_width)?;
-        let Some(right_row) = joined_row.right_row else {
+        if joined_row.right_row == UNMATCHED_RIGHT_ROW {
             return Some(&EMPTY_CELL);
-        };
+        }
         Some(
             right
-            .rows
-            .get(right_row)
-            .and_then(|source_row| source_row.get(right_column))
-            .unwrap_or(&EMPTY_CELL),
+                .rows
+                .get(joined_row.right_row as usize)
+                .and_then(|source_row| source_row.get(right_column))
+                .unwrap_or(&EMPTY_CELL),
         )
     }
 
@@ -190,8 +210,9 @@ pub struct JoinResult {
     /// 右表行中被匹配过的行数
     pub right_matched_rows: usize,
     pub out_rows: usize,
-    /// 输出表每行是否命中(与 table.rows 对齐;左连接未匹配的 A 行 = false,内连接全 true)
-    pub row_hit: Vec<bool>,
+    /// 输出行中命中的行数(结果表口径;重复键展开时可能大于 `left_matched`)。
+    /// 未命中行数 = `out_rows - matched_rows`,不再单独保存平行数组。
+    pub matched_rows: usize,
 }
 
 /// 连接输出行数的预估结果。
@@ -264,7 +285,7 @@ impl RowMatches {
 
 /// 右表索引。一次构建后可先做输出行数预估，再复用于真正 Join。
 struct JoinIndex {
-    rows: HashMap<String, RowMatches>,
+    rows: HashMap<String, RowMatches, RandomState>,
     max_dup: usize,
     expand_dup: bool,
     mode: KeyMode,
@@ -274,7 +295,7 @@ impl JoinIndex {
     fn build(right: &Table, rk: &[usize], mode: KeyMode, expand_dup: bool) -> Self {
         // 不按 B 总行数无条件 reserve：高重复数据的 distinct key 数可能远小于
         // B 行数，HashMap 按需增长能避免先分配一大块空桶。
-        let mut rows: HashMap<String, RowMatches> = HashMap::new();
+        let mut rows: HashMap<String, RowMatches, RandomState> = HashMap::default();
         let mut max_dup = 0usize;
 
         for (i, row) in right.rows.iter().enumerate() {
@@ -501,6 +522,13 @@ fn run_join(
     max_output_rows: Option<usize>,
     collect_timings: bool,
 ) -> Result<(JoinResult, JoinTimings), JoinLimitExceeded> {
+    // 结果行号用 u32 存放;源表真的超过 u32::MAX 行时下面的 `as u32` 会静默
+    // 截断成错误引用,所以入口直接拒绝。Excel 单表上限约 104 万行,仅防御。
+    assert!(
+        left.rows.len() <= u32::MAX as usize && right.rows.len() <= u32::MAX as usize,
+        "源表行数超过 u32 行号可表示的上限"
+    );
+
     let started = Instant::now();
     let index_started = Instant::now();
     let index = JoinIndex::build(right, &spec.right_keys, spec.key_mode, spec.expand_dup);
@@ -512,8 +540,16 @@ fn run_join(
     // 失败时都会清空它，容量增长仍可能分配，但不会逐行新建 String。
     let mut left_key = String::new();
 
-    // 有上限时在同一 JoinIndex 上预估，超限直接返回，避免第二次重建 B 索引。
-    let estimated_output = if let Some(limit) = max_output_rows {
+    // 有上限时先判断是否可能超限:任一 A 行最多命中「B 单键最大重复数」个右行
+    // (Left 下未命中的 A 行也只占 1 行),所以 left_rows × max(1, max_dup) 是
+    // 输出行数的可靠上界,而这个 max_dup 是索引构建时顺手统计的,不用扫 A 表。
+    // 上界不超过上限就必定通过,直接跳过对整张 A 表的预估扫描(那一遍的键
+    // 规范化开销与 probe 一遍相当);上界超过上限才走原预估流程,拒绝路径的
+    // 耗时、内存与精确诊断都不变,`timings.estimate` 也只在真正预估时填充。
+    let estimate_needed = max_output_rows
+        .is_some_and(|limit| left.rows.len().saturating_mul(index.max_dup.max(1)) > limit);
+    let estimated_output = if estimate_needed {
+        let limit = max_output_rows.expect("estimate_needed 蕴含存在上限");
         let preflight_started = Instant::now();
         let estimate = index.estimate(left, &spec.left_keys, spec.join_type, &mut left_key);
         timings.preflight = preflight_started.elapsed();
@@ -539,18 +575,19 @@ fn run_join(
     }
     let left_width = left.col_count();
     let mut joined_rows = Vec::new();
+    // 有精确预估值就用它;否则 Left 在「不展开」或「上界已证明不超过上限」
+    // 两种情形下每行至少产出一行,按 A 行数预留即可(上界保证不会更大)。
     let reserve_rows = estimated_output.or_else(|| {
-        (spec.join_type == JoinType::Left && !spec.expand_dup).then_some(left.rows.len())
+        let one_row_per_left =
+            spec.join_type == JoinType::Left && (!spec.expand_dup || max_output_rows.is_some());
+        one_row_per_left.then_some(left.rows.len())
     });
     if let Some(rows) = reserve_rows.filter(|&rows| rows < usize::MAX) {
         joined_rows.reserve(rows);
     }
-    let mut row_hit = Vec::new();
-    if let Some(rows) = reserve_rows.filter(|&rows| rows < usize::MAX) {
-        row_hit.reserve(rows);
-    }
 
     let mut left_matched = 0usize;
+    let mut matched_rows = 0usize;
     let mut right_used: Vec<bool> = vec![false; right.rows.len()];
     let measure = collect_timings;
     let mut probe_time = Duration::ZERO;
@@ -575,10 +612,10 @@ fn run_join(
                     right_used[right_index] = true;
                     let reference_started = measure.then(Instant::now);
                     joined_rows.push(JoinedRow {
-                        left_row: left_index,
-                        right_row: Some(right_index),
+                        left_row: left_index as u32,
+                        right_row: right_index as u32,
                     });
-                    row_hit.push(true);
+                    matched_rows += 1;
                     if let Some(reference_started) = reference_started {
                         materialize_time += reference_started.elapsed();
                     }
@@ -587,10 +624,9 @@ fn run_join(
             None if spec.join_type == JoinType::Left => {
                 let reference_started = measure.then(Instant::now);
                 joined_rows.push(JoinedRow {
-                    left_row: left_index,
-                    right_row: None,
+                    left_row: left_index as u32,
+                    right_row: UNMATCHED_RIGHT_ROW,
                 });
-                row_hit.push(false);
                 if let Some(reference_started) = reference_started {
                     materialize_time += reference_started.elapsed();
                 }
@@ -618,7 +654,7 @@ fn run_join(
             right_total: right.rows.len(),
             right_matched_rows,
             out_rows,
-            row_hit,
+            matched_rows,
         },
         timings,
     ))
@@ -693,6 +729,19 @@ mod tests {
         table.cell(left, right, row, column)
     }
 
+    /// 逐行取出命中标志,替代已删除的 `JoinResult::row_hit` 平行数组。
+    fn hits(result: &JoinResult) -> Vec<bool> {
+        (0..result.table.row_count())
+            .map(|row| result.table.row_hit(row))
+            .collect()
+    }
+
+    #[test]
+    fn joined_row_stays_compact() {
+        // 结果行数可达 500 万,行引用按 8B/行 存放;退回 Option<usize> 会变成 24B/行。
+        assert_eq!(std::mem::size_of::<JoinedRow>(), 8);
+    }
+
     #[test]
     fn left_join_vlookup() {
         let a = tbl(
@@ -708,15 +757,15 @@ mod tests {
             vec![
                 JoinedRow {
                     left_row: 0,
-                    right_row: Some(0),
+                    right_row: 0,
                 },
                 JoinedRow {
                     left_row: 1,
-                    right_row: None,
+                    right_row: UNMATCHED_RIGHT_ROW,
                 },
                 JoinedRow {
                     left_row: 2,
-                    right_row: Some(1),
+                    right_row: 1,
                 },
             ]
         );
@@ -735,7 +784,7 @@ mod tests {
         assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("x".into())));
         assert_eq!(joined_cell(&r.table, &a, &b, 1, 1), Some(&CellValue::Text("y".into())));
         // inner:未命中行被丢弃,输出全为命中行
-        assert_eq!(r.row_hit, vec![true, true]);
+        assert_eq!(hits(&r), vec![true, true]);
     }
 
     #[test]
@@ -745,7 +794,7 @@ mod tests {
         let b = tbl(&["id", "v"], &[&["1", "x"], &["3", "y"]]);
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT));
         assert_eq!(r.table.row_count(), 3);
-        assert_eq!(r.row_hit, vec![true, false, true]);
+        assert_eq!(hits(&r), vec![true, false, true]);
     }
 
     #[test]
@@ -758,7 +807,7 @@ mod tests {
         assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("a".into())));
         assert_eq!(joined_cell(&r.table, &a, &b, 1, 1), Some(&CellValue::Text("b".into())));
         // 展开的两行都算命中
-        assert_eq!(r.row_hit, vec![true, true]);
+        assert_eq!(hits(&r), vec![true, true]);
         assert_eq!(r.left_matched, 1);
         assert_eq!(r.right_matched_rows, 2);
     }
@@ -773,7 +822,7 @@ mod tests {
         let r = join(&a, &b, &sp);
         assert_eq!(r.table.row_count(), 1);
         assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("a".into())));
-        assert_eq!(r.row_hit, vec![true]);
+        assert_eq!(hits(&r), vec![true]);
         assert_eq!(r.right_matched_rows, 1); // 只算实际用到的一条 B
     }
 
@@ -847,6 +896,30 @@ mod tests {
         assert!(join_with_limit(&a, &b, &sp, Some(2)).is_err());
         sp.expand_dup = false;
         assert!(join_with_limit(&a, &b, &sp, Some(2)).is_ok());
+    }
+
+    #[test]
+    fn upper_bound_within_limit_skips_estimate_with_same_output() {
+        // A 两行、B 三行同键:上界 = 2 × 3 = 6,Left 展开实际输出 3 + 1 = 4 行。
+        let a = tbl(&["id"], &[&["1"], &["9"]]);
+        let b = tbl(&["id", "v"], &[&["1", "a"], &["1", "b"], &["1", "c"]]);
+        let sp = spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT);
+
+        // 上限 6 ≥ 上界 → 判定不可能超限,跳过 A 侧预估扫描直接连接。
+        let (skipped, skipped_timings) = join_with_limit_metrics(&a, &b, &sp, Some(6)).unwrap();
+        assert!(
+            skipped_timings.estimate.is_none(),
+            "上界不超过上限时不应再做整张 A 表的预估扫描"
+        );
+        assert_eq!(skipped.out_rows, 4);
+        assert_eq!(skipped.matched_rows, 3);
+        assert_eq!(skipped.left_matched, 1);
+
+        // 上限 5 < 上界 → 仍走预估路径,输出必须逐行一致。
+        let (estimated, estimated_timings) = join_with_limit_metrics(&a, &b, &sp, Some(5)).unwrap();
+        assert_eq!(estimated_timings.estimate.map(|e| e.output_rows), Some(4));
+        assert_eq!(estimated.table.rows, skipped.table.rows);
+        assert_eq!(estimated.matched_rows, skipped.matched_rows);
     }
 
     #[test]
@@ -1020,11 +1093,11 @@ mod tests {
         ]);
 
         let exact = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT));
-        assert_eq!(exact.row_hit, vec![false, true, false]);
+        assert_eq!(hits(&exact), vec![false, true, false]);
 
         let normalized = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::NORMALIZE));
         // Text("") 与纯空白在 trim 后相同，但仍不与 Empty 相同。
-        assert_eq!(normalized.row_hit, vec![false, true, true]);
+        assert_eq!(hits(&normalized), vec![false, true, true]);
     }
 
     #[test]

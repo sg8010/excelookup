@@ -739,6 +739,7 @@ dependencies = [
  "calamine",
  "eframe",
  "egui_extras",
+ "foldhash",
  "libc",
  "log",
  "rfd",

@@ -280,6 +280,18 @@ fn milliseconds(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+/// 命中标志的读法随版本不同:基线快照是物化实现,命中标志是 `JoinResult::row_hit`
+/// 平行数组;当前实现只保存行引用,命中由 `JoinedTable::row_hit` 派生。
+#[cfg(benchmark_baseline)]
+fn output_hit(result: &JoinResult, output: usize) -> bool {
+    result.row_hit[output]
+}
+
+#[cfg(not(benchmark_baseline))]
+fn output_hit(result: &JoinResult, output: usize) -> bool {
+    result.table.row_hit(output)
+}
+
 #[cfg(benchmark_baseline)]
 fn assert_output_row(
     result: &JoinResult,
@@ -397,13 +409,13 @@ fn run_case(case: Case) {
             if i < matched {
                 let indices = (i % distinct..right.rows.len()).step_by(distinct);
                 for ri in indices.take(if case.expand_dup { usize::MAX } else { 1 }) {
-                    assert!(result.row_hit[output]);
+                    assert!(output_hit(result, output));
                     assert_output_row(result, &left, &right, output, row, Some(ri), case);
                     used[ri] = true;
                     output += 1;
                 }
             } else if case.join_type == JoinType::Left {
-                assert!(!result.row_hit[output]);
+                assert!(!output_hit(result, output));
                 assert_output_row(result, &left, &right, output, row, None, case);
                 output += 1;
             }

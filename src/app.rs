@@ -8,7 +8,9 @@ use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke};
 use egui_extras::{Column, TableBuilder};
 
 use excelookup_lib::export::{ExportPhase, ExportProgress};
-use excelookup_lib::join::{join_with_limit, JoinedTable, JoinSpec, JoinType, KeyMode};
+use excelookup_lib::join::{
+    JoinLimitExceeded, JoinSpec, JoinType, JoinedTable, KeyMode, join_with_limit,
+};
 use excelookup_lib::model::{CellValue, Table};
 use excelookup_lib::read_xlsx::{ReadOptions, SheetTable};
 
@@ -28,6 +30,15 @@ struct LoadMsg {
     sheet_idx: Option<usize>,
     /// 成功 = 各工作表;失败 = 错误文案
     result: std::result::Result<Vec<SheetTable>, String>,
+}
+
+/// 后台 join 线程回主线程的结果。
+///
+/// 索引构建、连接、命中统计全在后台线程完成,结果整份 move 回来;世代号只保证
+/// 被换源/清空作废的旧结果不会落回,并不会中断旧线程的计算。
+struct JoinMsg {
+    generation: u64,
+    outcome: JoinOutcome,
 }
 
 /// 后台导出线程回主线程的消息。
@@ -160,6 +171,10 @@ pub struct ExcelLookupApp {
     result: Option<JoinOutcome>,
     /// 结果表行筛选状态(点击指标卡片切换;None=全部)
     row_filter: Option<RowFilter>,
+    /// 行筛选的行号缓存(按结果版本 + 筛选条件判定是否可复用)
+    filter_cache: Option<FilterCache>,
+    /// 结果版本号:每次产出结果递增,作为筛选缓存的失效依据
+    result_seq: u64,
     /// 后台加载通道收端(每帧 poll,取到即应用)
     load_rx: Option<std::sync::mpsc::Receiver<LoadMsg>>,
     /// 发端 clone 给每次 spawn 的后台线程(单收端收两侧结果)
@@ -168,6 +183,12 @@ pub struct ExcelLookupApp {
     load_gen: [u64; 2],
     /// 每侧是否正在后台加载
     load_active: [bool; 2],
+    /// 后台 join 通道收端
+    join_rx: Option<std::sync::mpsc::Receiver<JoinMsg>>,
+    /// join 请求世代号:换源/清空/重新连接时递增,使旧线程结果失效
+    join_gen: u64,
+    /// 是否有 join 正在后台运行(期间按钮置灰,避免多个大任务叠加占内存)
+    join_active: bool,
     /// 后台导出通道收端
     export_rx: Option<std::sync::mpsc::Receiver<ExportMsg>>,
     /// 导出请求世代号:清空/重算结果时递增,使旧线程结果失效
@@ -201,6 +222,45 @@ enum RowFilter {
     Unmatched,
 }
 
+/// 筛选后要显示的行号集合。
+///
+/// 500 万行的结果里「全部行」是最常见的筛选结果(全部命中/全部未命中),
+/// 这种情况直接按全集遍历,不物化行号表。
+#[derive(Clone)]
+enum FilteredRows {
+    /// 就是结果表的全部行
+    All,
+    /// 具体行号(升序);空集时为空 Vec,不产生分配
+    List(Arc<Vec<usize>>),
+}
+
+impl FilteredRows {
+    fn len(&self, total: usize) -> usize {
+        match self {
+            FilteredRows::All => total,
+            FilteredRows::List(rows) => rows.len(),
+        }
+    }
+
+    /// 第 `position` 个可见行在结果表中的行号。
+    fn index(&self, position: usize) -> usize {
+        match self {
+            FilteredRows::All => position,
+            FilteredRows::List(rows) => rows[position],
+        }
+    }
+}
+
+/// 行筛选的行号缓存。
+///
+/// 缓存键必须同时含结果版本与筛选条件:只比筛选条件会在重跑 join 后读到上一份
+/// 结果的行号。缓存只影响展示集合,不参与 join 语义。
+struct FilterCache {
+    result_id: u64,
+    filter: RowFilter,
+    rows: FilteredRows,
+}
+
 struct JoinOutcome {
     /// 只保存源行引用的结果视图,不拥有一份物化结果数据。
     table: Arc<JoinedTable>,
@@ -212,16 +272,38 @@ struct JoinOutcome {
     right_matched_rows: usize,
     right_total: usize,
     out_rows: usize,
-    /// 输出表每行是否命中(与 table.rows 对齐)
-    row_hit: Vec<bool>,
-    /// 命中行数(结果表口径;预计算避免每帧全扫 row_hit)
+    /// 命中行数(结果表口径;预计算避免每帧全扫行引用)
     matched_rows: usize,
     /// 未命中行数(结果表口径)
     unmatched_rows: usize,
+    /// 本次结果版本号(筛选缓存用;见 `FilterCache`)
+    result_id: u64,
     /// 本次执行是否展开重复键(结果展示说明用)
     expand_dup: bool,
     err: Option<String>,
     join_type: JoinType,
+}
+
+impl JoinOutcome {
+    /// 只带诊断文案的失败结果:不持有源表快照,也没有结果行。
+    fn error(message: String, join_type: JoinType, result_id: u64) -> Self {
+        Self {
+            table: Arc::new(JoinedTable::default()),
+            left_source: Arc::new(Table::default()),
+            right_source: Arc::new(Table::default()),
+            left_matched: 0,
+            left_total: 0,
+            right_matched_rows: 0,
+            right_total: 0,
+            out_rows: 0,
+            matched_rows: 0,
+            unmatched_rows: 0,
+            result_id,
+            expand_dup: false,
+            err: Some(message),
+            join_type,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -321,10 +403,15 @@ impl Default for ExcelLookupApp {
             expand_dup: true,
             result: None,
             row_filter: None,
+            filter_cache: None,
+            result_seq: 0,
             load_rx: None,
             load_tx: None,
             load_gen: [0, 0],
             load_active: [false, false],
+            join_rx: None,
+            join_gen: 0,
+            join_active: false,
             export_rx: None,
             export_gen: 0,
             export_state: ExportState::Idle,
@@ -376,6 +463,32 @@ impl ExcelLookupApp {
         self.export_rx = None;
         self.export_state = ExportState::Idle;
         self.export_location_error = None;
+    }
+
+    /// 作废在途/旧的 join 请求。后台线程仍会跑完,但结果回来时世代号不匹配,
+    /// 只会被丢弃(见 `poll_join`)。
+    fn invalidate_join(&mut self) {
+        self.join_gen = self.join_gen.wrapping_add(1);
+        self.join_rx = None;
+        self.join_active = false;
+    }
+
+    /// 丢弃当前连接结果及其展示状态(筛选条件与行号缓存一并失效)。
+    ///
+    /// 结果可能持有整张结果表与 A/B 源表快照的最后一份引用,析构放在 UI 线程上
+    /// 会造成可感知的帧停顿,因此整体移交后台线程释放。
+    fn drop_result(&mut self) {
+        self.row_filter = None;
+        self.filter_cache = None;
+        if let Some(outcome) = self.result.take() {
+            drop_in_background(outcome);
+        }
+    }
+
+    /// 取下一个结果版本号(筛选缓存的失效依据)。
+    fn next_result_id(&mut self) -> u64 {
+        self.result_seq = self.result_seq.wrapping_add(1);
+        self.result_seq
     }
 
     fn export_active(&self) -> bool {
@@ -584,8 +697,8 @@ impl ExcelLookupApp {
     ) {
         // 先释放旧连接结果:如果源表没有被其他快照引用,下面可以直接复用其行数据。
         self.invalidate_export();
-        self.result = None;
-        self.row_filter = None;
+        self.invalidate_join();
+        self.drop_result();
         if self.try_reheader_sheet(side, sheet_idx, &header_rows) {
             // 没有后台请求,也要让可能残留的旧消息失效。
             self.load_gen[side.index()] += 1;
@@ -716,8 +829,8 @@ impl ExcelLookupApp {
         // 新请求会使旧的连接结果立即失效,先释放可能很大的结果表,避免与新表
         // 一起存活到后台加载完成。
         self.invalidate_export();
-        self.result = None;
-        self.row_filter = None;
+        self.invalidate_join();
+        self.drop_result();
         // 新加载开始:清掉旧错误(加载成功/失败后再按结果设置)
         match side {
             Side::Left => self.left.error = None,
@@ -779,19 +892,20 @@ impl ExcelLookupApp {
     }
 
     /// 应用后台加载结果(主线程,帧末 poll 到后调用)。
-    /// 世代不匹配 = 已有更新的加载请求,丢弃旧结果。
-    fn apply_load_result(
-        &mut self,
-        side: Side,
-        generation: u64,
-        path: PathBuf,
-        header_rows: Vec<Option<usize>>,
-        sheet_idx: Option<usize>,
-        result: Result<Vec<SheetTable>, String>,
-    ) {
-        if generation != self.load_gen[side.index()] {
-            return; // 过期结果,丢弃
+    /// 世代不匹配 = 已有更新的加载请求,整份消息(可能装着整本工作簿)移交后台丢弃。
+    fn apply_load_result(&mut self, msg: LoadMsg) {
+        if msg.generation != self.load_gen[msg.side.index()] {
+            drop_in_background(msg);
+            return;
         }
+        let LoadMsg {
+            side,
+            path,
+            header_rows,
+            sheet_idx,
+            result,
+            ..
+        } = msg;
         self.load_active[side.index()] = false;
         // 计算需要哪些状态,借用 src 的代码全放在这个作用域里
         let mut reset = false;
@@ -822,7 +936,11 @@ impl ExcelLookupApp {
                         prev_header_rows.resize(sheet_count, None);
                         reset = prev_header_rows != requested;
                         src.header_rows = requested;
-                        src.sheets[sheet_idx] = LoadedSheet::from(sheet);
+                        // 旧工作表可能持有大表的最后一份引用,移交后台释放。
+                        drop_in_background(std::mem::replace(
+                            &mut src.sheets[sheet_idx],
+                            LoadedSheet::from(sheet),
+                        ));
                     } else {
                         if sheets.is_empty() {
                             src.error = Some("工作簿中无工作表".into());
@@ -839,7 +957,12 @@ impl ExcelLookupApp {
                         // 同一文件 + 各表列名行选择未变 → 列含义不变,保留键列/输出列
                         reset = !same_workbook || prev_header_rows != requested;
                         src.path = Some(path);
-                        src.sheets = sheets.into_iter().map(LoadedSheet::from).collect();
+                        // 整本旧工作簿可能持有大表的最后一份引用(百万行的
+                        // Vec/String 析构要遍历百万级堆块),移交后台释放。
+                        drop_in_background(std::mem::replace(
+                            &mut src.sheets,
+                            sheets.into_iter().map(LoadedSheet::from).collect(),
+                        ));
                         src.header_rows = requested;
                         if same_workbook && prev_sheet_idx < src.sheets.len() {
                             // 同文件重读(改列名行):停在原工作表
@@ -862,8 +985,7 @@ impl ExcelLookupApp {
         if reset {
             // 换文件/换列名行 = 列含义已变:键列/输出列需重选
             self.reset_side_on_source_change(side);
-            self.result = None;
-            self.row_filter = None;
+            self.drop_result();
         }
     }
 
@@ -879,8 +1001,7 @@ impl ExcelLookupApp {
         src.sheet_idx = idx;
         // 该侧表已切换:键列/输出列需重新选择
         self.reset_side_on_source_change(side);
-        self.result = None;
-        self.row_filter = None;
+        self.drop_result();
         if self.step == WorkflowStep::Result {
             self.step = WorkflowStep::Configure;
         }
@@ -890,6 +1011,8 @@ impl ExcelLookupApp {
     /// "下标合法但列含义已变"的静默错误),并清空该侧输出列(若为 B)。另一侧不受影响。
     fn reset_side_on_source_change(&mut self, side: Side) {
         self.invalidate_export();
+        // 该侧表要换了:在途 join 算的是换之前的快照,结果已无意义。
+        self.invalidate_join();
         match side {
             Side::Left => {
                 self.left_key_col = None;
@@ -901,78 +1024,51 @@ impl ExcelLookupApp {
         }
     }
 
-    fn run_join(&mut self) {
+    /// 执行连接。索引构建、连接与命中统计全在后台线程跑,期间界面保持可交互;
+    /// 完成后由 `poll_join` 在帧末装配结果。
+    fn run_join(&mut self, ctx: egui::Context) {
         self.invalidate_export();
+        self.invalidate_join();
+        self.drop_result();
         if !self.left.is_loaded() || !self.right.is_loaded() {
-            self.result = Some(JoinOutcome {
-                table: Arc::new(JoinedTable::default()),
-                left_source: Arc::new(Table::default()),
-                right_source: Arc::new(Table::default()),
-                left_matched: 0,
-                left_total: 0,
-                right_matched_rows: 0,
-                right_total: 0,
-                out_rows: 0,
-                row_hit: vec![],
-                matched_rows: 0,
-                unmatched_rows: 0,
-                expand_dup: false,
-                err: Some("请先加载两个数据源".into()),
-                join_type: self.join_type,
-            });
+            let result_id = self.next_result_id();
+            self.result = Some(JoinOutcome::error(
+                "请先加载两个数据源".into(),
+                self.join_type,
+                result_id,
+            ));
             self.step = WorkflowStep::Configure;
             return;
         }
 
-        // 当前 sheet 只克隆 Arc,不复制表格数据;结果视图和后台导出都会共享这两个快照。
+        // 当前 sheet 只克隆 Arc,不复制表格数据;结果视图和后台导出都会共享这两个快照,
+        // join 期间即便换源/切表,计算中的数据也不会被释放。
         let Some(left_table) = self.left.cur_sheet().map(|sheet| Arc::clone(&sheet.table)) else {
             return;
         };
         let Some(right_table) = self.right.cur_sheet().map(|sheet| Arc::clone(&sheet.table)) else {
             return;
         };
-        let left_t = left_table.as_ref();
-        let right_t = right_table.as_ref();
-        let lc = left_t.col_count();
-        let rc = right_t.col_count();
+        let lc = left_table.col_count();
+        let rc = right_table.col_count();
         if lc == 0 || rc == 0 {
-            self.result = Some(JoinOutcome {
-                table: Arc::new(JoinedTable::default()),
-                left_source: Arc::new(Table::default()),
-                right_source: Arc::new(Table::default()),
-                left_matched: 0,
-                left_total: 0,
-                right_matched_rows: 0,
-                right_total: 0,
-                out_rows: 0,
-                row_hit: vec![],
-                matched_rows: 0,
-                unmatched_rows: 0,
-                expand_dup: false,
-                err: Some("当前工作表无列数据".into()),
-                join_type: self.join_type,
-            });
+            let result_id = self.next_result_id();
+            self.result = Some(JoinOutcome::error(
+                "当前工作表无列数据".into(),
+                self.join_type,
+                result_id,
+            ));
             self.step = WorkflowStep::Configure;
             return;
         }
         // 键列未选择或当前表无列时不允许执行
         let (Some(lk), Some(rk)) = (self.left_key_col, self.right_key_col) else {
-            self.result = Some(JoinOutcome {
-                table: Arc::new(JoinedTable::default()),
-                left_source: Arc::new(Table::default()),
-                right_source: Arc::new(Table::default()),
-                left_matched: 0,
-                left_total: 0,
-                right_matched_rows: 0,
-                right_total: 0,
-                out_rows: 0,
-                row_hit: vec![],
-                matched_rows: 0,
-                unmatched_rows: 0,
-                expand_dup: false,
-                err: Some("请先在连接配置中选择 A/B 匹配列".into()),
-                join_type: self.join_type,
-            });
+            let result_id = self.next_result_id();
+            self.result = Some(JoinOutcome::error(
+                "请先在连接配置中选择 A/B 匹配列".into(),
+                self.join_type,
+                result_id,
+            ));
             self.step = WorkflowStep::Configure;
             return;
         };
@@ -997,120 +1093,159 @@ impl ExcelLookupApp {
         // 重复键展开防爆:预估与真正 Join 共享同一个 B 索引；超限只返回诊断，
         // 不再先统计一次再重新构建索引(避免大表重复扫描与重复 key 分配)。
         const MAX_EXPAND_ROWS: usize = 5_000_000;
-        let res = match join_with_limit(
-            left_t,
-            right_t,
-            &spec,
-            self.expand_dup.then_some(MAX_EXPAND_ROWS),
-        ) {
-            Ok(res) => res,
-            Err(limit) => {
-                let estimate = limit.estimate;
-                // 单位自适应:≥1 亿用亿,≥1 万用万,否则原样
-                let fmt = |n: usize| -> String {
-                    if n >= 100_000_000 {
-                        format!("{:.1} 亿", n as f64 / 100_000_000.0)
-                    } else if n >= 10_000 {
-                        format!("{:.1} 万", n as f64 / 10_000.0)
-                    } else {
-                        n.to_string()
-                    }
-                };
-                let a_rows = left_t.row_count();
-                let b_rows = right_t.row_count();
+        let max_output_rows = self.expand_dup.then_some(MAX_EXPAND_ROWS);
+        let join_type = self.join_type;
+        let expand_dup = self.expand_dup;
+        let left_rows = left_table.row_count();
+        let right_rows = right_table.row_count();
+        let result_id = self.next_result_id();
+        let generation = self.join_gen;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.join_rx = Some(rx);
+        self.join_active = true;
+        // 结果页先显示"正在连接";旧结果已在上方丢弃,不会和新结果混淆。
+        self.step = WorkflowStep::Result;
+        ctx.request_repaint();
 
-                // 诊断段落(多行;首行=标题,随后按行渲染)
-                let mut lines: Vec<String> = Vec::new();
-                lines.push(format!(
-                    "重复键展开后结果约 {} 行,远超可处理范围,已中止。",
-                    fmt(estimate.output_rows)
-                ));
-                lines.push(String::new());
-                lines.push("【数据诊断】".into());
-                lines.push(format!(
-                    "· A 表(主表)共 {a_rows} 行;B 表(匹配表)共 {b_rows} 行。"
-                ));
-
-                // 原因定位:先看 B 键重复度,再看单键极端值
-                if estimate.distinct_keys > 0
-                    && b_rows >= 10
-                    && b_rows / estimate.distinct_keys >= 10
-                {
-                    lines.push(format!(
-                        "· B 表键列几乎不唯一:{} 行只有 {} 个不同键值,单键最多重复 {} 次。",
-                        fmt(b_rows),
-                        fmt(estimate.distinct_keys),
-                        fmt(estimate.max_dup)
-                    ));
-                    lines.push("· 原因:匹配列很可能选成了“分类/枚举”类列(如省份、状态、类型),而非唯一编号列。".into());
-                } else if estimate.max_dup > 1000 {
-                    lines.push(format!(
-                        "· B 表键列存在单键重复 {} 次的极端值(去重后共 {} 个键)。",
-                        fmt(estimate.max_dup),
-                        fmt(estimate.distinct_keys)
-                    ));
-                    lines.push("· 原因:B 表存在大量同键行,可能数据本身重复,或键列粒度过粗。".into());
-                } else {
-                    lines.push(format!(
-                        "· B 表键去重后 {} 个(共 {} 行),A 表 {a_rows} 行平均每键命中多条。",
-                        fmt(estimate.distinct_keys),
-                        fmt(b_rows)
-                    ));
-                    lines.push("· 原因:A 与 B 的匹配列粒度不匹配(如明细对汇总),导致普遍一对多。".into());
+        let repaint_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            // catch_unwind:join 内部 panic(如源表行数超出 u32 行号上限)也要
+            // 变成可见的错误文案,不能让界面永远停在"正在连接"。
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match join_with_limit(&left_table, &right_table, &spec, max_output_rows) {
+                    Ok(res) => JoinOutcome {
+                        table: Arc::new(res.table),
+                        left_source: left_table,
+                        right_source: right_table,
+                        left_matched: res.left_matched,
+                        left_total: res.left_total,
+                        right_matched_rows: res.right_matched_rows,
+                        right_total: res.right_total,
+                        out_rows: res.out_rows,
+                        matched_rows: res.matched_rows,
+                        unmatched_rows: res.out_rows - res.matched_rows,
+                        result_id,
+                        expand_dup,
+                        err: None,
+                        join_type,
+                    },
+                    Err(limit) => JoinOutcome::error(
+                        Self::limit_exceeded_message(&limit, left_rows, right_rows),
+                        join_type,
+                        result_id,
+                    ),
                 }
+            }))
+            .unwrap_or_else(|_| {
+                JoinOutcome::error(
+                    "连接过程发生内部错误（已中止）".into(),
+                    join_type,
+                    result_id,
+                )
+            });
 
-                lines.push(String::new());
-                lines.push("【排查步骤】".into());
-                lines.push("1. 返回“连接配置”,检查 A、B 两表的匹配列是否都选了编号/ID 类唯一列。".into());
-                lines.push("2. 在“数据源”页确认 B 表:健康键列的去重个数应接近表行数(如 39 万行应有几十万个不同键)。".into());
-                lines.push("3. 若 B 表确实同键多行(如一人多条记录),请关闭“重复键展开”开关(只取第一条,VLOOKUP 风格)。".into());
-                lines.push("4. 若确认键列无误仍过大,可先对 A 表筛选/去重后再连接。".into());
+            let _ = tx.send(JoinMsg {
+                generation,
+                outcome,
+            });
+            repaint_ctx.request_repaint();
+        });
+    }
 
-                self.result = Some(JoinOutcome {
-                    table: Arc::new(JoinedTable::default()),
-                    left_source: Arc::new(Table::default()),
-                    right_source: Arc::new(Table::default()),
-                    left_matched: 0,
-                    left_total: 0,
-                    right_matched_rows: 0,
-                    right_total: 0,
-                    out_rows: 0,
-                    row_hit: vec![],
-                    matched_rows: 0,
-                    unmatched_rows: 0,
-                    expand_dup: true,
-                    err: Some(lines.join("\n")),
-                    join_type: self.join_type,
-                });
-                self.step = WorkflowStep::Result;
-                return;
+    /// 每帧非阻塞地收取后台 join 结果。
+    fn poll_join(&mut self) {
+        let messages: Vec<JoinMsg> = if let Some(rx) = &self.join_rx {
+            let mut messages = Vec::new();
+            while let Ok(message) = rx.try_recv() {
+                messages.push(message);
+            }
+            messages
+        } else {
+            Vec::new()
+        };
+
+        for message in messages {
+            if message.generation != self.join_gen {
+                // 已作废的结果(期间换源/清空/重新连接):可能持有整张结果表与
+                // 源表快照,移交后台线程释放。
+                drop_in_background(message.outcome);
+                continue;
+            }
+            self.join_rx = None;
+            self.join_active = false;
+            self.drop_result();
+            self.result = Some(message.outcome);
+            // 一次连接尝试都以结果页收尾:成功是结果表,失败是诊断卡片。用户中途
+            // 离开结果页也会被带回来,和连接在 UI 线程上跑时的行为一致。
+            self.step = WorkflowStep::Result;
+        }
+    }
+
+    /// 重复键展开超出上限时的诊断文案:标题 + 数据诊断 + 排查步骤。
+    fn limit_exceeded_message(limit: &JoinLimitExceeded, a_rows: usize, b_rows: usize) -> String {
+        let estimate = limit.estimate;
+        // 单位自适应:≥1 亿用亿,≥1 万用万,否则原样
+        let fmt = |n: usize| -> String {
+            if n >= 100_000_000 {
+                format!("{:.1} 亿", n as f64 / 100_000_000.0)
+            } else if n >= 10_000 {
+                format!("{:.1} 万", n as f64 / 10_000.0)
+            } else {
+                n.to_string()
             }
         };
-        let matched_rows = res.row_hit.iter().filter(|&&h| h).count();
-        self.result = Some(JoinOutcome {
-            table: Arc::new(res.table),
-            left_source: left_table,
-            right_source: right_table,
-            left_matched: res.left_matched,
-            left_total: res.left_total,
-            right_matched_rows: res.right_matched_rows,
-            right_total: res.right_total,
-            out_rows: res.out_rows,
-            matched_rows,
-            unmatched_rows: res.row_hit.len() - matched_rows,
-            row_hit: res.row_hit,
-            expand_dup: self.expand_dup,
-            err: None,
-            join_type: self.join_type,
-        });
-        self.row_filter = None;
-        self.step = WorkflowStep::Result;
+
+        // 诊断段落(多行;首行=标题,随后按行渲染)
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!(
+            "重复键展开后结果约 {} 行,远超可处理范围,已中止。",
+            fmt(estimate.output_rows)
+        ));
+        lines.push(String::new());
+        lines.push("【数据诊断】".into());
+        lines.push(format!(
+            "· A 表(主表)共 {a_rows} 行;B 表(匹配表)共 {b_rows} 行。"
+        ));
+
+        // 原因定位:先看 B 键重复度,再看单键极端值
+        if estimate.distinct_keys > 0 && b_rows >= 10 && b_rows / estimate.distinct_keys >= 10 {
+            lines.push(format!(
+                "· B 表键列几乎不唯一:{} 行只有 {} 个不同键值,单键最多重复 {} 次。",
+                fmt(b_rows),
+                fmt(estimate.distinct_keys),
+                fmt(estimate.max_dup)
+            ));
+            lines.push("· 原因:匹配列很可能选成了“分类/枚举”类列(如省份、状态、类型),而非唯一编号列。".into());
+        } else if estimate.max_dup > 1000 {
+            lines.push(format!(
+                "· B 表键列存在单键重复 {} 次的极端值(去重后共 {} 个键)。",
+                fmt(estimate.max_dup),
+                fmt(estimate.distinct_keys)
+            ));
+            lines.push("· 原因:B 表存在大量同键行,可能数据本身重复,或键列粒度过粗。".into());
+        } else {
+            lines.push(format!(
+                "· B 表键去重后 {} 个(共 {} 行),A 表 {a_rows} 行平均每键命中多条。",
+                fmt(estimate.distinct_keys),
+                fmt(b_rows)
+            ));
+            lines.push("· 原因:A 与 B 的匹配列粒度不匹配(如明细对汇总),导致普遍一对多。".into());
+        }
+
+        lines.push(String::new());
+        lines.push("【排查步骤】".into());
+        lines.push("1. 返回“连接配置”,检查 A、B 两表的匹配列是否都选了编号/ID 类唯一列。".into());
+        lines.push("2. 在“数据源”页确认 B 表:健康键列的去重个数应接近表行数(如 39 万行应有几十万个不同键)。".into());
+        lines.push("3. 若 B 表确实同键多行(如一人多条记录),请关闭“重复键展开”开关(只取第一条,VLOOKUP 风格)。".into());
+        lines.push("4. 若确认键列无误仍过大,可先对 A 表筛选/去重后再连接。".into());
+
+        lines.join("\n")
     }
 
     fn clear_result(&mut self) {
         self.invalidate_export();
-        self.result = None;
-        self.row_filter = None;
+        self.invalidate_join();
+        self.drop_result();
         if self.sources_ready() {
             self.step = WorkflowStep::Configure;
         }
@@ -1118,13 +1253,14 @@ impl ExcelLookupApp {
 
     fn clear_sources(&mut self) {
         self.invalidate_export();
-        self.left = Source::default();
-        self.right = Source::default();
+        self.invalidate_join();
+        // 两侧旧表可能各自持有大表的最后一份引用,移交后台线程释放。
+        drop_in_background(std::mem::take(&mut self.left));
+        drop_in_background(std::mem::take(&mut self.right));
         self.left_key_col = None;
         self.right_key_col = None;
         self.right_pick_cols.clear();
-        self.result = None;
-        self.row_filter = None;
+        self.drop_result();
         // 作废所有在途加载请求(清空后旧结果不得落回)
         self.load_gen[0] += 1;
         self.load_gen[1] += 1;
@@ -1138,11 +1274,11 @@ impl ExcelLookupApp {
     /// 输出列清空——主从关系已变,带出字段需重新确认。
     fn swap_sources(&mut self) {
         self.invalidate_export();
+        self.invalidate_join();
         std::mem::swap(&mut self.left, &mut self.right);
         std::mem::swap(&mut self.left_key_col, &mut self.right_key_col);
         self.right_pick_cols.clear();
-        self.result = None;
-        self.row_filter = None;
+        self.drop_result();
         self.step = WorkflowStep::Sources;
     }
 
@@ -1166,7 +1302,8 @@ impl ExcelLookupApp {
         match step {
             WorkflowStep::Sources => true,
             WorkflowStep::Configure => self.sources_ready(),
-            WorkflowStep::Result => self.result_ready(),
+            // 连接进行中也允许回到结果页看进度占位。
+            WorkflowStep::Result => self.join_active || self.result_ready(),
         }
     }
 
@@ -1227,15 +1364,9 @@ impl eframe::App for ExcelLookupApp {
             Vec::new()
         };
         for msg in msgs {
-            self.apply_load_result(
-                msg.side,
-                msg.generation,
-                msg.path,
-                msg.header_rows,
-                msg.sheet_idx,
-                msg.result,
-            );
+            self.apply_load_result(msg);
         }
+        self.poll_join();
         self.poll_export();
         // 帧末:处理对话框(rfd 是阻塞调用,必须放在帧末;内置对话框也统一在这里画)
         self.drive_dialog(ui.ctx());
@@ -1604,7 +1735,9 @@ impl ExcelLookupApp {
                 }
             }
             WorkflowStep::Result => {
-                if self.result_ready() {
+                if self.join_active {
+                    ("结果预览", "正在连接…")
+                } else if self.result_ready() {
                     ("结果预览", "检查命中情况并导出")
                 } else {
                     ("结果预览", "执行连接后查看")
@@ -2357,8 +2490,15 @@ impl ExcelLookupApp {
 
         Self::action_row(ui, "配置会保留，可随时返回调整", |ui| {
             let keys_ready = self.left_key_col.is_some() && self.right_key_col.is_some();
-            if Self::primary_button(ui, "执行连接并查看结果  →", 180.0, keys_ready).clicked() {
-                self.run_join();
+            // join 期间置灰:世代号只保证旧结果不落回,不会停下旧线程的计算。
+            let busy = self.join_active;
+            let label = if busy {
+                "正在连接…"
+            } else {
+                "执行连接并查看结果  →"
+            };
+            if Self::primary_button(ui, label, 180.0, keys_ready && !busy).clicked() {
+                self.run_join(ui.ctx().clone());
             }
             if Self::secondary_button(ui, "上一步", 72.0).clicked() {
                 self.go_to_step(WorkflowStep::Sources);
@@ -2436,6 +2576,8 @@ impl ExcelLookupApp {
     fn ui_step_result(&mut self, ui: &mut egui::Ui) {
         let status = if self.export_active() {
             Some("正在导出")
+        } else if self.join_active {
+            Some("正在连接")
         } else if self.result_ready() {
             Some("连接完成")
         } else {
@@ -2456,6 +2598,14 @@ impl ExcelLookupApp {
         let Some(result) = &self.result else {
             ui.vertical_centered(|ui| {
                 ui.add_space(24.0);
+                if self.join_active {
+                    ui.label(
+                        egui::RichText::new("正在后台连接两张表…")
+                            .size(16.0)
+                            .color(Self::blue()),
+                    );
+                    return;
+                }
                 ui.label(egui::RichText::new("执行连接后，结果会显示在这里").size(16.0).color(Self::muted()));
                 ui.add_space(12.0);
                 if Self::primary_button(ui, "返回连接配置", 130.0, true).clicked() {
@@ -2804,38 +2954,50 @@ impl ExcelLookupApp {
         }
     }
 
-    fn ui_result_table(&self, ui: &mut egui::Ui) {
+    fn ui_result_table(&mut self, ui: &mut egui::Ui) {
         let Some(result) = &self.result else { return };
         if result.err.is_some() || result.table.col_count() == 0 {
             return;
         }
 
-        let table = &result.table;
-        let left_source = &result.left_source;
-        let right_source = &result.right_source;
+        // Arc 克隆只是引用计数,避免在重建筛选缓存时与 self.result 的借用冲突。
+        let table = Arc::clone(&result.table);
+        let left_source = Arc::clone(&result.left_source);
+        let right_source = Arc::clone(&result.right_source);
         let headers = table.headers.clone();
         let ncols = table.col_count();
-        // 行筛选:已匹配/未命中(按 row_hit 标记过滤);None=全部
+        let matched_rows = result.matched_rows;
+        let unmatched_rows = result.unmatched_rows;
+        let result_id = result.result_id;
+        // 行筛选:已匹配/未命中(按行引用派生的命中标志过滤);None=全部
         let row_filter = self.row_filter;
-        let row_hit = &result.row_hit;
-        let visible_rows: Option<Vec<usize>> = match row_filter {
-            Some(f) => Some(
-                table
-                    .rows
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, _)| {
-                        let hit = row_hit.get(index).copied().unwrap_or(true);
-                        let want_hit = matches!(f, RowFilter::Matched);
-                        (hit == want_hit).then_some(index)
-                    })
-                    .collect(),
-            ),
+        // 每帧对 500 万行重新收集一遍行号是滚动卡顿的根源,按「结果版本 + 筛选
+        // 条件」缓存;全命中/全未命中直接复用全集,不物化行号表。
+        let visible_rows: Option<FilteredRows> = match row_filter {
             None => None,
+            Some(filter) => {
+                let cached = self
+                    .filter_cache
+                    .as_ref()
+                    .filter(|cache| cache.result_id == result_id && cache.filter == filter)
+                    .map(|cache| cache.rows.clone());
+                Some(match cached {
+                    Some(rows) => rows,
+                    None => {
+                        let rows = filter_rows(&table, filter, matched_rows, unmatched_rows);
+                        self.filter_cache = Some(FilterCache {
+                            result_id,
+                            filter,
+                            rows: rows.clone(),
+                        });
+                        rows
+                    }
+                })
+            }
         };
         let row_count = visible_rows
             .as_ref()
-            .map(|rows| rows.len())
+            .map(|rows| rows.len(table.row_count()))
             .unwrap_or(table.row_count());
 
         if row_count == 0 {
@@ -2893,13 +3055,13 @@ impl ExcelLookupApp {
                         body.rows(row_h, row_count, |mut row| {
                             let index = visible_rows
                                 .as_ref()
-                                .map(|rows| rows[row.index()])
+                                .map(|rows| rows.index(row.index()))
                                 .unwrap_or(row.index());
                             for column in 0..ncols {
                                 row.col(|ui| {
                                     // 列 clip 时单元格 wrap_mode=Truncate,Label 默认在文本
                                     // 被截断(elided)时自动弹全文 tooltip,无需手动添加。
-                                    match table.cell(left_source, right_source, index, column) {
+                                    match table.cell(&left_source, &right_source, index, column) {
                                         None | Some(CellValue::Empty) => {
                                             ui.label(
                                                 egui::RichText::new("—")
@@ -3017,6 +3179,45 @@ impl ExcelLookupApp {
             style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(16.0));
             style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(29.0));
         });
+    }
+}
+
+/// 计算行筛选后要显示的行号。
+///
+/// 筛选结果与全集/空集重合时(全部命中、全部未命中)不物化行号表——500 万行的
+/// 结果里这种情况很常见,直接按全集遍历即可。
+fn filter_rows(
+    table: &JoinedTable,
+    filter: RowFilter,
+    matched_rows: usize,
+    unmatched_rows: usize,
+) -> FilteredRows {
+    let want_hit = matches!(filter, RowFilter::Matched);
+    let selected = if want_hit { matched_rows } else { unmatched_rows };
+    if selected == 0 {
+        return FilteredRows::List(Arc::new(Vec::new()));
+    }
+    if selected == table.row_count() {
+        return FilteredRows::All;
+    }
+    let rows: Vec<usize> = (0..table.row_count())
+        .filter(|&index| table.row_hit(index) == want_hit)
+        .collect();
+    FilteredRows::List(Arc::new(rows))
+}
+
+/// 把「可能是最后一份引用」的对象整体移交后台线程析构。
+///
+/// 百万行表是 `Vec<Vec<CellValue>>` 加每格 `String` 的层级结构,析构要遍历百万级
+/// 堆块;若发生在 UI 线程上,换文件、重读、清空、结果替换都会带来可感知的帧停顿。
+/// 注意必须 move 整个持有者而不是单独 clone 出的 `Arc`——只有最后一份引用进了线程,
+/// 析构才真的发生在后台。线程创建失败时闭包在调用线程上析构,等价于原地 drop。
+fn drop_in_background<T: Send + 'static>(value: T) {
+    if let Err(error) = std::thread::Builder::new()
+        .name("excelookup-drop".to_owned())
+        .spawn(move || drop(value))
+    {
+        log::warn!("后台释放线程创建失败,改为当前线程释放: {error}");
     }
 }
 
