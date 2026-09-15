@@ -186,8 +186,10 @@ pub struct ExcelLookupApp {
     last_dir: Option<PathBuf>,
     /// 对调 A/B 后帧末统一处理(重置键列/输出列/结果)
     pending_swap: bool,
-    /// 启动诊断用:首帧 UI 到达后标记启动完成。
+    /// 启动诊断用:首帧真正呈现到屏幕后才标记启动完成。
     startup_ready: Option<Arc<AtomicBool>>,
+    /// 启动诊断用:已进入的帧数。第二帧开始时说明首帧已经完成呈现。
+    startup_frames: u32,
 }
 
 /// 结果表行筛选(点击对应指标卡激活,再次点击取消)
@@ -334,6 +336,7 @@ impl Default for ExcelLookupApp {
             last_dir: None,
             pending_swap: false,
             startup_ready: None,
+            startup_frames: 0,
         }
     }
 }
@@ -1241,11 +1244,23 @@ impl eframe::App for ExcelLookupApp {
             self.swap_sources();
         }
 
-        // 放在整帧 UI 逻辑完成后,这样首帧中途发生 panic 或卡住时 watchdog
-        // 仍能报告为启动阶段故障。
-        if let Some(startup_ready) = self.startup_ready.take() {
-            startup_ready.store(true, Ordering::Release);
-            log::info!("首帧界面已显示,启动完成");
+        // 进入第二帧才宣告启动完成:第一帧的绘制和呈现发生在 ui() 返回之后,若图形
+        // 驱动卡在首帧的缓冲交换里,ui() 不会再被调用,watchdog 仍能按启动超时报告,
+        // 而不会因为标记过早置位、日志里反而写着"已经启动完成"。
+        if self.startup_ready.is_some() {
+            self.startup_frames = self.startup_frames.saturating_add(1);
+            if self.startup_frames >= 2 {
+                if let Some(startup_ready) = self.startup_ready.take() {
+                    startup_ready.store(true, Ordering::Release);
+                }
+                // 图形初始化已经成功,后面每帧的 winit/glutin debug 只会让日志迅速膨胀。
+                log::set_max_level(log::LevelFilter::Info);
+                log::info!("界面已显示,启动完成");
+            } else {
+                // 界面静止时 egui 不会自己重绘,必须主动要一帧,否则健康运行的窗口
+                // 可能一直不进入第二帧,反倒被看门狗当成启动超时杀掉。
+                ui.ctx().request_repaint();
+            }
         }
     }
 }

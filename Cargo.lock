@@ -739,6 +739,7 @@ dependencies = [
  "calamine",
  "eframe",
  "egui_extras",
+ "libc",
  "log",
  "rfd",
  "rust_xlsxwriter",

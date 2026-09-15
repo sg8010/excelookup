@@ -31,12 +31,17 @@
 
 ### Debian 软件包安装
 
-Debian 软件包按系统规范安装到 `/usr/bin/excelookup`，并自动创建桌面菜单项：
+Debian 软件包按系统规范安装，并自动创建桌面菜单项：
 
 ```bash
 sudo apt install ./excelookup_版本_arm64.deb
-# 程序：/usr/bin/excelookup
+# 启动器：/usr/bin/excelookup（真正的二进制在 /usr/lib/excelookup/excelookup）
 ```
+
+`/usr/bin/excelookup` 是一个启动脚本，负责把启动日志写到固定位置（见下），真正的
+程序在 `/usr/lib/excelookup/excelookup`。包内已声明 X11/OpenGL 运行库依赖——这些库
+由 glutin/winit 在运行时动态加载，`dpkg` 从二进制的依赖表里看不到，不显式声明的话
+会出现“包装得上、一启动就退出”。
 
 如果只下载裸二进制文件，可直接运行：
 
@@ -44,6 +49,8 @@ sudo apt install ./excelookup_版本_arm64.deb
 chmod +x excelookup-linux-arm64
 ./excelookup-linux-arm64
 ```
+
+直接用裸二进制时日志照常写入，只是脚本那一层负责的记录（见下）不参与。
 
 ### 启动失败排查
 
@@ -57,6 +64,28 @@ chmod +x excelookup-linux-arm64
 如果系统设置了 `XDG_STATE_HOME`,日志位于
 `$XDG_STATE_HOME/excelookup/startup.log`。日志中包含程序架构、UOS/内核版本、
 `DISPLAY` 等桌面环境变量以及 X11/OpenGL 动态库探测结果,反馈问题时请一并提供该文件。
+时间戳是 UTC（形如 `2026-09-15T00:32:14Z`），后面跟的 `+0.012s` 是相对本次启动的
+耗时，卡在哪一步、卡了多久可以直接看出来。图形初始化期间的 glutin/winit 调试细节
+只记到界面显示为止——之后收回到 Info 级别，否则空闲时每帧的窗口调用会把日志写成一个
+很大的文件。
+
+排查时还需要知道这几件事：
+
+- **`startup.log.1` 是上一次启动的日志。** 每次启动都会把上一个日志轮转成 `.1`，
+  所以“失败一次、再启动一次就正常”这种情况下，失败证据仍然保留在 `.1` 里。
+  偶发故障请把两个文件一起提供。
+- **动态链接器报错也在日志里。** 缺少运行库、glibc 版本不够这类失败发生在程序自己
+  的代码运行之前，程序来不及写日志；Debian 包的启动脚本会先把标准错误重定向进同一
+  个日志文件，所以“双击了但没有任何反应”时，日志开头可能有
+  `error while loading shared libraries: ...` 这样的内容。裸二进制没有这一层。
+- **崩溃会留下最后一条记录。** 段错误、总线错误、非法指令、中止这些会直接杀死进程
+  的信号，会在日志末尾补一行 `异常终止: 收到信号 11 (段错误)`，紧邻的上一行就是
+  崩溃前最后执行的步骤。被 `SIGKILL`（例如 OOM killer）杀掉时无法捕获，日志只会
+  中断在最后一条记录上。
+- **看不到提示时日志里有原因。** 程序会依次尝试 zenity / kdialog / xmessage /
+  notify-send / x-terminal-emulator / xdg-open 来展示错误；目标机上这些工具可能都
+  没有，此时用户看不到任何提示。每次尝试的结果都会记进日志，可以用它确认用户到底
+  看到过什么。
 
 Linux 图形版需要 X11 和 OpenGL/EGL 运行库;不同 UOS 设备的显卡驱动和运行库可能不同,
 所以“系统版本相同”不代表运行环境完全相同。
@@ -146,6 +175,7 @@ Join 性能基准使用同一驱动直接编译原始基线和当前核心库（
 src/
 ├── main.rs        # 二进制入口(GUI)
 ├── app.rs         # egui 界面:数据源卡片 / 连接配置 / 结果表
+├── startup.rs     # 启动诊断:启动日志、超时看门狗、崩溃留痕、错误提示
 ├── file_dialog.rs # 内置文件对话框(Linux;不依赖 Portal / zenity)
 ├── lib.rs         # 库入口
 ├── model.rs       # 数据模型 CellValue / Table
@@ -156,7 +186,7 @@ src/
 scripts/join_bench.rs # 两版共用的性能基准驱动
 scripts/bench-baseline/ # 本轮修改前的核心源码快照
 build.rs           # Windows 目标时把 assets/icon.ico 嵌入 exe(交叉编译也生效)
-assets/            # icon.png(窗口/任务栏图标)、icon.ico(exe 图标资源)
+assets/            # icon.png / icon.ico,以及 excelookup-launcher.sh(启动器脚本)
 tests/end_to_end.rs  # 真实文件端到端测试
 ```
 

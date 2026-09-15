@@ -18,10 +18,19 @@ maintainer = "sg8010 <sg8011@outlook.com>"
 copyright = "sg8010"
 section = "utils"
 priority = "optional"
-depends = "$auto"
+# $auto 只能看到二进制的 DT_NEEDED(libc6/libgcc-s1)。glutin/winit 是通过 dlopen
+# 加载 X11/GL 库的,dpkg-shlibdeps 看不见,所以这些运行库必须显式声明,否则包
+# 装得上、运行时却因为找不到库而起不来。libgl1 在 buster 系发行版(UOS)由
+# libgl1-mesa-glx 提供,故保留可选写法。
+depends = "$auto, libgl1 | libgl1-mesa-glx, libegl1, libx11-6, libx11-xcb1, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libxcursor1, libxi6, libxrandr2, libxfixes3, libxrender1"
+# DRI 驱动缺失时 EGL/GLX 仍会失败,但用哪个驱动取决于显卡厂商,因此只做推荐。
+recommends = "libgl1-mesa-dri"
 maintainer-scripts = "debian"
 assets = [
-    ["target/release/excelookup", "usr/bin/excelookup", "755"],
+    # 真正的二进制放在 /usr/lib;usr/bin/excelookup 是启动器脚本,负责把发生在
+    # main() 之前的动态链接/exec 报错也写进启动日志。
+    ["target/release/excelookup", "usr/lib/excelookup/excelookup", "755"],
+    ["assets/excelookup-launcher.sh", "usr/bin/excelookup", "755"],
     ["assets/excelookup.desktop", "usr/share/applications/excelookup.desktop", "644"],
     ["assets/icon.png", "usr/share/icons/hicolor/256x256/apps/excelookup.png", "644"],
 ]
@@ -40,6 +49,11 @@ calamine = "0.36"
 rust_xlsxwriter = { version = "0.99", features = ["constant_memory"] }
 anyhow = "1"
 log = "0.4"
+
+# 信号处理器要直接用 write(2) 往日志 fd 里写"崩溃前最后一口气",只能用 libc。
+# 该 crate 本来就在依赖树里(winit/glutin 间接引入),不产生额外下载。
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 # Linux 目标不使用 rfd:它靠 XDG Desktop Portal,Portal 缺失时会回退成调用
 # `zenity` 外部进程,精简桌面/无桌面环境上会直接没反应。Linux 改用内置的 egui
