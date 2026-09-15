@@ -8,6 +8,7 @@ ExcelLookup:Rust + egui/eframe 0.36 的 Excel 双表 Join GUI。交付 Linux arm
 - **所有用户可见文案必须中文**(产品名、A/B、VLOOKUP 除外)
 - join/read/export 是纯逻辑 lib(`excelookup_lib`),**不得依赖 GUI**;新功能先 lib+单测再接 UI
 - `egui::FontData` 需包 `Arc`;egui 默认无 CJK → `app.rs::install_cjk_font()` 运行时加载系统字体,勿内嵌大字体
+- GUI 层按职责拆分:`app.rs` 只放状态类型 + `App::ui` 入口;`src/app/` 子模块按 `impl ExcelLookupApp` 分文件(workers=后台任务/对话框编排,theme=色板控件,shell=侧栏顶栏,step_sources/config/result=三步页)。子模块方法标 `pub(crate)`,勿把单步骤状态抽成子 struct
 - eframe 0.36 的 `App` trait 入口是 `fn ui(&mut self, ui: &mut egui::Ui, …)`(旧版 `update(&Context)` 已不存在)
 - **文件对话框**:Linux 用内置 egui 对话框(`src/file_dialog.rs` + lib 的 `filebrowser`),不用 rfd —— rfd 在 Linux 靠 XDG Portal,Portal 缺失会回退调 `zenity` 外部进程,精简桌面/无桌面目标机上直接没反应;Windows 仍用 rfd(原生 IFileDialog),依赖按 target 区隔(Cargo.toml)
 - 对话框请求先记到 `DialogRequest`,帧末在 `drive_dialog()` 统一处理:rfd 是阻塞调用,内置对话框也走同一条路,两条实现行为一致
