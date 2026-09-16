@@ -25,6 +25,7 @@
 
 use std::path::{Path, PathBuf};
 
+use excelookup_lib::model::CellValue;
 use excelookup_lib::read_xlsx::{
     ReadOptions, ReadPath, SheetTable, read_sheet_opts_path, read_workbook, read_workbook_opts,
 };
@@ -395,6 +396,64 @@ fn chartsheet_reads_as_empty_table_on_both_paths() {
         );
         assert_eq!(sheet.auto_header_row, None, "{read_path:?}");
     }
+}
+
+/// 迟到的左移:表头与首条数据只占 C/D 列,后续数据行突然在更靠左的 B 列出值。
+///
+/// 首条数据物化时 `min_col=C`;B 列出现后整表最小列左移,已物化的行无法右移
+/// 对齐(末尾 `resize` 只能补空)。流式必须回退 `Range` —— 强制 `Stream` 按
+/// 接口约定报"无法流式读取",`Auto` 回退后与 `Range` 逐格一致。这是
+/// `offset` 用例覆盖不到的形态:`offset` 只向右扩展,这里才是真正触发
+/// `Fallback` 设计的场景(该 bug 曾导致首条数据静默错列)。
+#[test]
+fn late_left_shift_falls_back_to_range() {
+    let path = temp_path("late_left_shift.xlsx");
+    let mut wb = Workbook::new();
+    let s = wb.add_worksheet();
+    s.set_name("shift").unwrap();
+    s.write_string(0, 2, "id").unwrap();
+    s.write_string(0, 3, "姓名").unwrap();
+    s.write_number(1, 2, 1.0).unwrap();
+    s.write_string(1, 3, "张三").unwrap();
+    // 第二条数据突然在更靠左的 B 列出值 → 整表最小列在物化后左移
+    s.write_string(2, 1, "X").unwrap();
+    s.write_number(2, 2, 2.0).unwrap();
+    s.write_string(2, 3, "李四").unwrap();
+    wb.save(&path).unwrap();
+
+    // 强制流式:按接口约定报"无法流式读取"
+    let err = read_sheet_opts_path(&path, "shift", None, true, ReadPath::Stream)
+        .expect_err("左移表应触发流式回退而不是静默错列");
+    assert!(
+        err.to_string().contains("无法流式读取"),
+        "错误文案不符: {err}"
+    );
+
+    // Auto 回退后与 Range 逐字段一致
+    let auto = read_sheet_opts_path(&path, "shift", None, true, ReadPath::Auto).unwrap();
+    let range = read_sheet_opts_path(&path, "shift", None, true, ReadPath::Range).unwrap();
+    assert_eq!(auto.table.headers, range.table.headers, "列名不同");
+    assert_eq!(auto.table.rows, range.table.rows, "数据行不同");
+    assert_eq!(auto.preview, range.preview, "预览文本不同");
+    assert_eq!(auto.preview_cells, range.preview_cells, "预览单元格不同");
+    assert_eq!(
+        auto.preview_non_empty, range.preview_non_empty,
+        "预览非空标记不同"
+    );
+    assert_eq!(auto.used_header_row, range.used_header_row, "实际列名行不同");
+    assert_eq!(auto.auto_header_row, range.auto_header_row, "自动列名行不同");
+    assert_eq!(
+        auto.first_row_number, range.first_row_number,
+        "首行号不同"
+    );
+
+    // 钉死错列这一失效形态:Range 口径下首条数据的 B 列是空,值从 C 列起
+    assert_eq!(auto.table.cell(0, 0), Some(&CellValue::Empty));
+    assert_eq!(auto.table.cell(0, 1), Some(&CellValue::Number(1.0)));
+    assert_eq!(
+        auto.table.cell(0, 2),
+        Some(&CellValue::Text("张三".into()))
+    );
 }
 
 /// 未知扩展名 / 无扩展名的 xlsx 也要被判成流式路径(内容探测,不看扩展名)。

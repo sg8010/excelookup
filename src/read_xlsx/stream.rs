@@ -19,9 +19,9 @@
 //!
 //! **回退**
 //!
-//! 只有一种情况必须放弃流式:某数据行出现比"已见最小列号"更小的列。已输出的
-//! 行是定宽(按最小列对齐)的,而整表的最小列此时会左移,宽度口径就错了。这种
-//! 畸形表交给调用方重开工作簿走 `Range` 路径。
+//! 只有一种情况必须放弃流式:已有数据行物化之后,整表最小列又向左移。已物化
+//! 的行是定宽(按物化时的最小列对齐)的,无法整体右移,宽度口径就此错开。
+//! 这种畸形表交给调用方重开工作簿走 `Range` 路径。
 
 use std::path::Path;
 
@@ -91,6 +91,9 @@ struct Streamer {
     header_abs: Option<u32>,
     header_raw: Vec<(u32, Data)>,
     data_rows: Vec<Vec<CellValue>>,
+    /// 已物化数据行展开时使用的最小列号。`min_col` 在 `add_cell` 里随流
+    /// 更新(只会变小);它一旦小于本值,已物化行就无法右移对齐 → 回退
+    materialized_min_col: Option<u32>,
     /// 列名行未定前先缓存的行(有界:见 `pending_cap`)
     pending: Vec<SparseRow>,
     fallback: bool,
@@ -111,6 +114,7 @@ impl Streamer {
             header_abs: None,
             header_raw: Vec::new(),
             data_rows: Vec::new(),
+            materialized_min_col: None,
             pending: Vec::new(),
             fallback: false,
             cur: None,
@@ -162,15 +166,6 @@ impl Streamer {
             cur.raw.push((col, raw_of(value)));
         }
         cur.cells.push((col, cell_from_ref(value)));
-    }
-
-    /// 数据行出现比当前最小列更小的列 → 整表宽度会左移,必须回退
-    fn would_shift(&self, row: &SparseRow) -> bool {
-        self.has_value
-            && row
-                .cells
-                .iter()
-                .any(|(c, v)| *c < self.min_col && !matches!(v, CellValue::Empty))
     }
 
     fn finish_row(&mut self, row: SparseRow) {
@@ -242,9 +237,14 @@ impl Streamer {
         }
     }
 
-    /// 数据行:先查宽度左移,再按已知宽度展开
+    /// 数据行:先查最小列左移,再按当前最小列展开
     fn push_data(&mut self, row: SparseRow) {
-        if self.would_shift(&row) {
+        // `min_col` 在 `add_cell` 里已含当前行,所以这里不能查"当前行有没
+        // 有更小的列"(永远查不到),要查"首个数据行物化之后最小列又变小了"。
+        if self
+            .materialized_min_col
+            .is_some_and(|base| self.min_col < base)
+        {
             self.fallback = true;
             self.data_rows.clear();
             return;
@@ -252,6 +252,7 @@ impl Streamer {
         if !row.non_empty {
             return;
         }
+        self.materialized_min_col = Some(self.min_col);
         self.table_rows = self.table_rows.saturating_add(1);
         let width = (self.max_col - self.min_col + 1) as usize;
         let mut out = vec![CellValue::Empty; width];
