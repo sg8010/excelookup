@@ -152,6 +152,39 @@ fn make_bulk_workbook(path: &Path, rows: usize, cols: usize) {
     wb.save(path).unwrap();
 }
 
+/// 整本回退用例:before(正常)→ shift(中途左移,触发 `Fallback`)→ after(正常)。
+/// `after` 必须有数据,才能验证"同一 handle 回退后还能继续流式读下一张表"。
+fn make_shift_workbook(path: &Path) {
+    let mut wb = Workbook::new();
+    {
+        let s = wb.add_worksheet();
+        s.set_name("before").unwrap();
+        s.write_string(0, 0, "id").unwrap();
+        s.write_string(0, 1, "v").unwrap();
+        s.write_number(1, 0, 1.0).unwrap();
+        s.write_string(1, 1, "a").unwrap();
+    }
+    {
+        let s = wb.add_worksheet();
+        s.set_name("shift").unwrap();
+        s.write_string(0, 2, "id").unwrap();
+        s.write_string(0, 3, "姓名").unwrap();
+        s.write_number(1, 2, 1.0).unwrap();
+        s.write_string(1, 3, "张三").unwrap();
+        s.write_string(2, 1, "X").unwrap();
+        s.write_number(2, 2, 2.0).unwrap();
+        s.write_string(2, 3, "李四").unwrap();
+    }
+    {
+        let s = wb.add_worksheet();
+        s.set_name("after").unwrap();
+        s.write_string(0, 0, "k").unwrap();
+        s.write_string(1, 0, "z").unwrap();
+        s.write_number(2, 0, 7.0).unwrap();
+    }
+    wb.save(path).unwrap();
+}
+
 fn temp_path(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("excelookup-stream-tests");
     std::fs::create_dir_all(&dir).unwrap();
@@ -311,32 +344,7 @@ fn read_workbook_opts_matches_range_path() {
         };
         let stream = read_workbook_opts(&path, opts.clone()).unwrap();
         let range = read_workbook_all_range(&path, opts.clone());
-        assert_eq!(
-            stream.len(),
-            range.len(),
-            "表数不同(header_rows={header_rows:?})"
-        );
-        for (a, b) in stream.iter().zip(range.iter()) {
-            let ctx = format!("sheet={} header_rows={header_rows:?}", a.name);
-            assert_eq!(a.name, b.name, "[{ctx}] 表名不同");
-            assert_eq!(a.table.headers, b.table.headers, "[{ctx}] 列名不同");
-            assert_eq!(a.table.rows.len(), b.table.rows.len(), "[{ctx}] 行数不同");
-            for (index, (ra, rb)) in a.table.rows.iter().zip(b.table.rows.iter()).enumerate() {
-                assert_eq!(ra, rb, "[{ctx}] 第 {index} 行不同");
-            }
-            assert_eq!(a.preview, b.preview, "[{ctx}] 预览不同");
-            assert_eq!(
-                a.preview_non_empty, b.preview_non_empty,
-                "[{ctx}] 预览非空不同"
-            );
-            assert_eq!(a.preview_cells, b.preview_cells, "[{ctx}] 预览单元格不同");
-            assert_eq!(a.used_header_row, b.used_header_row, "[{ctx}] 列名行不同");
-            assert_eq!(
-                a.auto_header_row, b.auto_header_row,
-                "[{ctx}] 自动列名行不同"
-            );
-            assert_eq!(a.first_row_number, b.first_row_number, "[{ctx}] 首行号不同");
-        }
+        assert_workbooks_agree(&stream, &range, &format!("header_rows={header_rows:?}"));
     }
 }
 
@@ -360,6 +368,69 @@ fn read_workbook_all_range(
             read_sheet_opts_path(path, name, requested, opts.preview, ReadPath::Range).unwrap()
         })
         .collect()
+}
+
+/// 逐表逐字段断言两份"整本"结果一致(`read_workbook_opts` vs 逐表 Range 参考)。
+fn assert_workbooks_agree(actual: &[SheetTable], expected: &[SheetTable], ctx: &str) {
+    assert_eq!(actual.len(), expected.len(), "[{ctx}] 表数不同");
+    for (a, b) in actual.iter().zip(expected.iter()) {
+        let ctx = format!("{ctx} sheet={}", a.name);
+        assert_eq!(a.name, b.name, "[{ctx}] 表名不同");
+        assert_eq!(a.table.headers, b.table.headers, "[{ctx}] 列名不同");
+        assert_eq!(a.table.rows.len(), b.table.rows.len(), "[{ctx}] 行数不同");
+        for (index, (ra, rb)) in a.table.rows.iter().zip(b.table.rows.iter()).enumerate() {
+            assert_eq!(ra, rb, "[{ctx}] 第 {index} 行不同");
+        }
+        assert_eq!(a.preview, b.preview, "[{ctx}] 预览不同");
+        assert_eq!(
+            a.preview_non_empty, b.preview_non_empty,
+            "[{ctx}] 预览非空不同"
+        );
+        assert_eq!(a.preview_cells, b.preview_cells, "[{ctx}] 预览单元格不同");
+        assert_eq!(a.used_header_row, b.used_header_row, "[{ctx}] 列名行不同");
+        assert_eq!(
+            a.auto_header_row, b.auto_header_row,
+            "[{ctx}] 自动列名行不同"
+        );
+        assert_eq!(a.first_row_number, b.first_row_number, "[{ctx}] 首行号不同");
+    }
+}
+
+/// 整本读取中的同 handle 回退:中间表左移触发 `Fallback` 后,后续表仍须正确读出。
+///
+/// GUI 首次整本加载走 `read_workbook_opts`:同一 workbook handle 上逐表流式,
+/// 某表回退时用同一 handle 的 `worksheet_range` 补读,然后继续流式读下一张表。
+/// 这与 `late_left_shift_falls_back_to_range` 覆盖的"重开工作簿"是两条不同的
+/// 回退路径 —— `XlsxCellReader` 已推进过底层 zip 流,若 handle 复用有问题,
+/// 后续表会读不出来或拿到错位数据。
+#[test]
+fn workbook_fallback_keeps_later_sheets_correct() {
+    let path = temp_path("workbook_shift.xlsx");
+    make_shift_workbook(&path);
+
+    for preview in [true, false] {
+        let opts = ReadOptions {
+            header_rows: Vec::new(),
+            preview,
+        };
+        let actual = read_workbook_opts(&path, opts.clone()).unwrap();
+        let expected = read_workbook_all_range(&path, opts);
+        assert_workbooks_agree(&actual, &expected, &format!("preview={preview}"));
+    }
+
+    // 钉死两件事:shift 表确实回了 Range 口径(B 列在前),after 表数据完好
+    let actual = read_workbook_opts(&path, ReadOptions::default()).unwrap();
+    let shift = &actual[1];
+    assert_eq!(shift.name, "shift");
+    assert_eq!(shift.table.cell(0, 0), Some(&CellValue::Empty));
+    assert_eq!(shift.table.cell(0, 1), Some(&CellValue::Number(1.0)));
+    let after = &actual[2];
+    assert_eq!(after.name, "after");
+    assert_eq!(
+        after.table.cell(0, 0),
+        Some(&CellValue::Text("z".into()))
+    );
+    assert_eq!(after.table.cell(1, 0), Some(&CellValue::Number(7.0)));
 }
 
 /// 自动分派(`ReadPath::Auto`)必须与强制流式结果一致,
