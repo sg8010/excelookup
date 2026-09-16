@@ -3,13 +3,31 @@
 //! 支持 .xlsx / .xls / .xlsb / .ods;返回所有 sheet 名及各 sheet 的表数据。
 //! 列名行默认取首个非空行(前导空行跳过),也可由调用方指定——首行是合并大标题、
 //! 第二行才是列名时,用 [`ReadOptions::header_row`] 指定第二行即可。
+//!
+//! **两条读表路径**
+//!
+//! - `Range`(`table_from_range`):calamine 先展开成稠密 `Range<Data>`,再转
+//!   `Table`。所有格式通用,是等价性的参考答案。
+//! - 流式(`stream` 子模块):xlsx/xlsm 逐格直接建 `Table`,不驻留稠密矩阵。
+//!   大表单表峰值可降 20%~58%(见 `stream.rs` 模块文档)。
+//!
+//! 分派依据是 [`calamine::Sheets`] 的变体——它是 `open_workbook_auto` 按**内容**
+//! 探测出来的结果,不是文件扩展名(无扩展名/未知扩展名的 xlsx 也能被正确识别)。
+//! 用同一份判断做分派,不会出现"扩展名说是 xlsx、内容其实是 xls"的错配。
+//!
+//! 流式失败/不适用时回退 `Range` 路径。回退会**重新打开工作簿**而不是复用当前
+//! handle:`XlsxCellReader` 会部分推进那个 zip 成员流,复用依赖 calamine 的内部
+//! 实现细节;重开一次只花约 0.5ms,相对读表耗时可忽略。
+
+pub mod stream;
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use calamine::{open_workbook_auto, Data, Reader};
+use calamine::{open_workbook_auto, Data, Reader, Sheets};
 
 use crate::model::{CellValue, Table};
+use stream::StreamRead;
 
 /// 顶部原始行预览默认条数(UI 用它列出可选列名行)
 pub const PREVIEW_ROWS: usize = 8;
@@ -58,6 +76,11 @@ pub fn read_workbook(path: &Path) -> Result<Vec<(String, Table)>> {
 }
 
 /// 读取一个工作簿的全部 sheets,带读取选项(列名行可按工作表指定)。
+///
+/// 与 [`read_sheet_opts`] 一样按内容分派路径;逐表复用同一个已打开的工作簿
+/// (open 要解析 sharedStrings,大表上不能免费重做)。单表流式不适用/需回退时,
+/// 该表退回 `Range` 路径 —— **不再重开工作簿**,因为 `worksheet_range` 会自己新建
+/// 一个单元格读取器,不受当前表流式读取的影响。
 pub fn read_workbook_opts(path: &Path, opts: ReadOptions) -> Result<Vec<SheetTable>> {
     let mut workbook = open_workbook_auto(path)
         .with_context(|| format!("无法打开文件: {}", path.display()))?;
@@ -69,22 +92,88 @@ pub fn read_workbook_opts(path: &Path, opts: ReadOptions) -> Result<Vec<SheetTab
 
     let mut out = Vec::with_capacity(names.len());
     for (index, name) in names.iter().enumerate() {
-        let mut range = workbook
-            .worksheet_range(name)
-            .with_context(|| format!("读取工作表「{}」失败", name))?;
         // 该表指定的列名行(未指定 = 自动)
         let requested = opts.header_rows.get(index).copied().flatten();
-        let mut sheet = table_from_range(&mut range, requested, opts.preview);
+        let mut sheet =
+            match stream::read_sheet_with_workbook(&mut workbook, name, requested, opts.preview)? {
+            StreamRead::Done(sheet) => sheet,
+            // chartsheet 等非工作表:与 Range 路径一致地返回空表
+            StreamRead::NotAWorksheet => SheetTable::default(),
+            // 非 xlsx 或结构畸形:本表退回 Range 路径(同一 handle 上新建读取器)
+            StreamRead::Unsupported | StreamRead::Fallback => {
+                let mut range = workbook
+                    .worksheet_range(name)
+                    .with_context(|| format!("读取工作表「{}」失败", name))?;
+                table_from_range(&mut range, requested, opts.preview)
+            }
+        };
         sheet.name = name.clone();
         out.push(sheet);
     }
     Ok(out)
 }
 
+/// 读表路径(测试用开关;生产环境由 [`read_sheet_opts`] 自动分派)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadPath {
+    /// 自动:xlsx 走流式,其余走 `Range`;流式不适用时回退
+    Auto,
+    /// 强制 `Range` 路径(稠密矩阵)
+    Range,
+    /// 强制流式(非 xlsx 或结构畸形时报错)
+    Stream,
+}
+
 /// 只读取工作簿中的一个工作表。
 ///
 /// 改列名行时调用此函数即可,避免为了重建当前表而重新解析整个工作簿。
+/// 走哪条路径见 [`ReadPath`]。
 pub fn read_sheet_opts(
+    path: &Path,
+    sheet_name: &str,
+    requested: Option<usize>,
+    preview: bool,
+) -> Result<SheetTable> {
+    read_sheet_opts_path(path, sheet_name, requested, preview, ReadPath::Auto)
+}
+
+/// 带路径开关的读表入口,供差分测试同时驱动两条实现。
+pub fn read_sheet_opts_path(
+    path: &Path,
+    sheet_name: &str,
+    requested: Option<usize>,
+    preview: bool,
+    read_path: ReadPath,
+) -> Result<SheetTable> {
+    if read_path != ReadPath::Range {
+        match stream::read_sheet_stream(path, sheet_name, requested, preview)? {
+            StreamRead::Done(sheet) => {
+                return Ok(SheetTable {
+                    name: sheet_name.to_owned(),
+                    ..sheet
+                });
+            }
+            // chartsheet 等非工作表:Range 路径返回 Ok(空表),这里保持一致。
+            // 不能退化成报错,否则含图表页的工作簿会从"显示空表"变成"打开失败"。
+            StreamRead::NotAWorksheet => {
+                return Ok(SheetTable {
+                    name: sheet_name.to_owned(),
+                    ..SheetTable::default()
+                });
+            }
+            StreamRead::Unsupported | StreamRead::Fallback => {
+                if read_path == ReadPath::Stream {
+                    anyhow::bail!("该文件无法流式读取,请改用 Range 路径");
+                }
+                // 回退:重开工作簿(不复用已推进的 handle)
+            }
+        }
+    }
+    read_sheet_range(path, sheet_name, requested, preview)
+}
+
+/// `Range` 路径:稠密矩阵 → `Table`(两条路径的等价性参考答案)
+pub(crate) fn read_sheet_range(
     path: &Path,
     sheet_name: &str,
     requested: Option<usize>,
@@ -100,13 +189,18 @@ pub fn read_sheet_opts(
     Ok(sheet)
 }
 
+/// 该文件是否会被走流式路径(内容探测,不看扩展名)。仅用于诊断日志。
+pub fn supports_stream_read(path: &Path) -> bool {
+    matches!(open_workbook_auto(path), Ok(Sheets::Xlsx(_)))
+}
+
 /// 已用区域内第一个非空行(前导空行全部跳过)
 fn first_non_empty_row(range: &calamine::Range<Data>, height: usize) -> Option<usize> {
     (0..height).find(|&ri| range[ri].iter().any(|c| !matches!(c, Data::Empty)))
 }
 
 /// 预览用文本(与 [`CellValue::display`] 口径一致:整数不带小数点)
-fn data_display(d: &Data) -> String {
+pub(crate) fn data_display(d: &Data) -> String {
     match d {
         Data::Float(f) if f.fract() == 0.0 && f.is_finite() => format!("{:.0}", f),
         Data::Empty => String::new(),
@@ -223,7 +317,7 @@ fn data_clone_cell(d: &Data) -> CellValue {
 
 /// 移动版 data→cell:把可变 Data 中的 String 等 take 出来(留下 Data::Empty),
 /// 避免大表下每格字符串 clone。
-fn data_take_cell(d: &mut Data) -> CellValue {
+pub(crate) fn data_take_cell(d: &mut Data) -> CellValue {
     match d {
         Data::String(s) => CellValue::Text(std::mem::take(s)),
         Data::DateTimeIso(s) | Data::DurationIso(s) => CellValue::Text(std::mem::take(s)),
