@@ -185,9 +185,22 @@ fn make_shift_workbook(path: &Path) {
     wb.save(path).unwrap();
 }
 
-fn temp_path(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("excelookup-stream-tests");
+/// 每个用例独占的临时目录(同名残留先清掉)。
+///
+/// 不能让多个用例共用一个目录:并行跑时同名文件会互相踩 ——
+/// `Workbook::save` 是 `File::create`(先把文件截断成 0 字节)再写内容,
+/// 另一边正好 `open_workbook_auto` 就会读到空文件,随机报"无法打开文件"。
+fn test_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "excelookup-stream-tests-{}-{tag}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn temp_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(name)
 }
 
@@ -268,7 +281,8 @@ impl SheetView for SheetTable {
 /// 边界表 × 所有列名行选择(自动 + 越界/空行/数据行/错误行等) × 两种预览开关
 #[test]
 fn stream_matches_range_on_edge_workbook() {
-    let path = temp_path("edge.xlsx");
+    let dir = test_dir("edge");
+    let path = temp_path(&dir, "edge.xlsx");
     make_edge_workbook(&path);
 
     for sheet in [
@@ -285,7 +299,8 @@ fn stream_matches_range_on_edge_workbook() {
 /// 规模表:数据行远多于列名行判定窗口,覆盖"流式已定型后长跑"的路径
 #[test]
 fn stream_matches_range_on_bulk_workbook() {
-    let path = temp_path("bulk.xlsx");
+    let dir = test_dir("bulk");
+    let path = temp_path(&dir, "bulk.xlsx");
     make_bulk_workbook(&path, 400, 6);
 
     for sheet in ["sheet0", "sheet1", "sheet2"] {
@@ -302,7 +317,8 @@ fn stream_matches_range_on_bulk_workbook() {
 /// 被当成空行跳过)。流式实现若把"非空"建立在已转换的 `CellValue` 上,这两处会一起错。
 #[test]
 fn error_cells_are_dropped_but_count_as_non_empty() {
-    let path = temp_path("edge.xlsx");
+    let dir = test_dir("errors");
+    let path = temp_path(&dir, "edge.xlsx");
     make_edge_workbook(&path);
 
     // 前置:确认错误单元格真的造出来了(否则本测试是空转)
@@ -330,7 +346,8 @@ fn error_cells_are_dropped_but_count_as_non_empty() {
 /// 流式/回退,所以这里比对的是"表数组"而不是单表。
 #[test]
 fn read_workbook_opts_matches_range_path() {
-    let path = temp_path("edge.xlsx");
+    let dir = test_dir("workbook_opts");
+    let path = temp_path(&dir, "edge.xlsx");
     make_edge_workbook(&path);
 
     for header_rows in [
@@ -405,7 +422,8 @@ fn assert_workbooks_agree(actual: &[SheetTable], expected: &[SheetTable], ctx: &
 /// 后续表会读不出来或拿到错位数据。
 #[test]
 fn workbook_fallback_keeps_later_sheets_correct() {
-    let path = temp_path("workbook_shift.xlsx");
+    let dir = test_dir("workbook_shift");
+    let path = temp_path(&dir, "workbook_shift.xlsx");
     make_shift_workbook(&path);
 
     for preview in [true, false] {
@@ -437,7 +455,8 @@ fn workbook_fallback_keeps_later_sheets_correct() {
 /// 否则说明分派逻辑给出了与"用户的文件其实是 xlsx"不符的判断。
 #[test]
 fn auto_dispatch_uses_stream_for_xlsx() {
-    let path = temp_path("edge.xlsx");
+    let dir = test_dir("auto_dispatch");
+    let path = temp_path(&dir, "edge.xlsx");
     make_edge_workbook(&path);
     for sheet in ["basic", "titled", "empty", "errors"] {
         let auto = read_sheet_opts_path(&path, sheet, None, true, ReadPath::Auto).unwrap();
@@ -455,7 +474,8 @@ fn auto_dispatch_uses_stream_for_xlsx() {
 /// 行为回归(两条路径对非工作表的语义本来就不一致)。
 #[test]
 fn chartsheet_reads_as_empty_table_on_both_paths() {
-    let path = temp_path("edge.xlsx");
+    let dir = test_dir("chartsheet");
+    let path = temp_path(&dir, "edge.xlsx");
     make_edge_workbook(&path);
     for read_path in [ReadPath::Range, ReadPath::Stream, ReadPath::Auto] {
         let sheet = read_sheet_opts_path(&path, "chart", None, true, read_path)
@@ -478,7 +498,8 @@ fn chartsheet_reads_as_empty_table_on_both_paths() {
 /// `Fallback` 设计的场景(该 bug 曾导致首条数据静默错列)。
 #[test]
 fn late_left_shift_falls_back_to_range() {
-    let path = temp_path("late_left_shift.xlsx");
+    let dir = test_dir("late_left_shift");
+    let path = temp_path(&dir, "late_left_shift.xlsx");
     let mut wb = Workbook::new();
     let s = wb.add_worksheet();
     s.set_name("shift").unwrap();
@@ -531,10 +552,11 @@ fn late_left_shift_falls_back_to_range() {
 /// 这是"按扩展名分派"会漏掉的场景。
 #[test]
 fn content_detection_not_extension() {
-    let source = temp_path("edge.xlsx");
+    let dir = test_dir("content_detection");
+    let source = temp_path(&dir, "edge.xlsx");
     make_edge_workbook(&source);
-    let no_ext = temp_path("no_extension_file");
-    let odd_ext = temp_path("odd.weird");
+    let no_ext = temp_path(&dir, "no_extension_file");
+    let odd_ext = temp_path(&dir, "odd.weird");
     std::fs::copy(&source, &no_ext).unwrap();
     std::fs::copy(&source, &odd_ext).unwrap();
 
