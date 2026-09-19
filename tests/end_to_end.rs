@@ -4,6 +4,7 @@ mod support;
 
 use std::path::PathBuf;
 
+use calamine::{open_workbook_auto, Data, Reader};
 use rust_xlsxwriter::Workbook;
 
 use excelookup_lib::export::write_joined_xlsx;
@@ -412,19 +413,22 @@ fn zero_left_output_columns_export_only_right_columns() {
         expand_dup: true,
     };
     let result = join(left, right, &spec);
-    // 空 left_pick 仍算「有输出列」(B 侧还有),UI 不会拦这个配置。
+    // 空 left_pick 仍算「有输出列」(B 侧还有),输出列判据本身放行。
     assert!(spec.has_output_columns(left.col_count(), right.col_count()));
+    // 但没有任何匹配列在输出中:UI 与 worker 会拦下这份配置;lib 本身不强制,导出仍可验证。
+    assert!(!spec.has_key_output(left.col_count(), right.col_count()));
     assert_eq!(result.table.headers, ["部门"]);
     assert_eq!(result.left_matched, 2);
     write_joined_xlsx(&result.table, left, right, &out).unwrap();
-    let back = read_workbook(&out).unwrap();
-    let actual = &back[0].1;
-    assert_eq!(actual.headers, ["部门"]);
-    // 内存结果保留 3 行,其中未命中行的输出全空;读取器不保留全空行,因此读回 2 行。
+    // 按工作表绝对坐标验证,未命中行保持为空且不挤掉后续匹配行。
     assert_eq!(result.table.row_count(), 3);
-    assert_eq!(actual.row_count(), 2);
-    assert_eq!(actual.cell(0, 0), Some(&CellValue::from("工程部")));
-    assert_eq!(actual.cell(1, 0), Some(&CellValue::from("产品部")));
+    let mut workbook = open_workbook_auto(&out).unwrap();
+    let actual = workbook.worksheet_range_at(0).unwrap().unwrap();
+    assert_eq!(actual.get_size(), (4, 1));
+    assert_eq!(actual.get_value((0, 0)), Some(&Data::String("部门".into())));
+    assert_eq!(actual.get_value((1, 0)), Some(&Data::String("工程部".into())));
+    assert_eq!(actual.get_value((2, 0)), Some(&Data::Empty));
+    assert_eq!(actual.get_value((3, 0)), Some(&Data::String("产品部".into())));
 }
 
 /// 全部越界的 A 输出列等于没选:导出侧不出现空列。
@@ -449,13 +453,13 @@ fn out_of_range_left_output_columns_export_without_empty_columns() {
     let result = join(left, right, &spec);
     assert_eq!(result.table.headers, ["部门"]);
     write_joined_xlsx(&result.table, left, right, &out).unwrap();
-    let back = read_workbook(&out).unwrap();
-    let actual = &back[0].1;
-    assert_eq!(actual.headers, ["部门"]);
-    assert_eq!(actual.col_count(), 1);
-    // 内存结果保留 3 行,其中未命中行的输出全空;读取器不保留全空行,因此读回 2 行。
+    // 按工作表绝对坐标验证,越界的 A 列不占输出列,未命中行保持为空。
     assert_eq!(result.table.row_count(), 3);
-    assert_eq!(actual.row_count(), 2);
-    assert_eq!(actual.cell(0, 0), Some(&CellValue::from("工程部")));
-    assert_eq!(actual.cell(1, 0), Some(&CellValue::from("产品部")));
+    let mut workbook = open_workbook_auto(&out).unwrap();
+    let actual = workbook.worksheet_range_at(0).unwrap().unwrap();
+    assert_eq!(actual.get_size(), (4, 1));
+    assert_eq!(actual.get_value((0, 0)), Some(&Data::String("部门".into())));
+    assert_eq!(actual.get_value((1, 0)), Some(&Data::String("工程部".into())));
+    assert_eq!(actual.get_value((2, 0)), Some(&Data::Empty));
+    assert_eq!(actual.get_value((3, 0)), Some(&Data::String("产品部".into())));
 }

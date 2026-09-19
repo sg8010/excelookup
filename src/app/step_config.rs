@@ -46,7 +46,17 @@ impl ExcelLookupApp {
                             .color(Self::muted()),
                     );
                     ui.add_space(7.0);
+                    let before = self.left_key_col;
                     Self::col_combo(ui, "workflow_a_key", &left_headers, &mut self.left_key_col);
+                    // A 匹配列默认带出:换键时把新键补进显式选择(None 本就是全选)
+                    if self.left_key_col != before
+                        && let (Some(key), Some(columns)) =
+                            (self.left_key_col, self.left_pick_cols.as_mut())
+                        && !columns.contains(&key)
+                    {
+                        columns.push(key);
+                        columns.sort_unstable();
+                    }
                 });
                 cols[1].vertical(|ui| {
                     ui.label(
@@ -83,9 +93,14 @@ impl ExcelLookupApp {
                             .color(Self::muted()),
                     );
                     ui.add_space(7.0);
+                    let before = self.right_key_col;
                     Self::col_combo(ui, "workflow_b_key", &right_headers, &mut self.right_key_col);
-                    // 键列不允许作为输出列:改了键,同步从输出列中剔除
-                    self.right_pick_cols.retain(|&c| Some(c) != self.right_key_col);
+                    // B 匹配列默认不带出:换键时把新键从输出列剔除,之后用户可手动勾上
+                    if self.right_key_col != before
+                        && let Some(key) = self.right_key_col
+                    {
+                        self.right_pick_cols.retain(|&c| c != key);
+                    }
                 });
             });
         });
@@ -106,10 +121,7 @@ impl ExcelLookupApp {
                 );
             });
             ui.add_space(10.0);
-            // 不在渲染期写回 self.left_pick_cols:打开配置页是纯读操作,None(默认全选)
-            // 只在用户真的点了某一列时才变成显式列表。
-            // 默认态不构造列表:选中与否按「已有选择均含该序号」判断,只有真点击时
-            // 才展开成显式 Vec,否则每帧重绘都要生成/克隆整份选择。
+            // 默认全选不构造列表，仅在用户点击时生成并保存显式选择。
             let explicit = self.left_pick_cols.as_deref();
             let selected_at = |edited: Option<&Vec<usize>>, index: usize| match edited {
                 Some(columns) => columns.contains(&index),
@@ -136,8 +148,13 @@ impl ExcelLookupApp {
                     }
                 }
                 if !has_output_columns(edited.as_deref().or(explicit), &[], left_headers.len(), 0) {
+                    let note = if self.join_type == JoinType::Left {
+                        "未选择 A 输出列，未命中行将为空行"
+                    } else {
+                        "未选择 A 输出列"
+                    };
                     ui.label(
-                        egui::RichText::new("未选择 A 输出列")
+                        egui::RichText::new(note)
                             .size(12.0)
                             .color(Self::soft()),
                     );
@@ -154,7 +171,7 @@ impl ExcelLookupApp {
                 ui.label(egui::RichText::new("B 输出列").size(13.0).strong().color(Self::muted()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new("选择需要带入结果的字段")
+                        egui::RichText::new("选择需要带入结果的字段；B 匹配列默认不带出")
                             .size(12.0)
                             .color(Self::soft()),
                     );
@@ -173,7 +190,7 @@ impl ExcelLookupApp {
                     );
                 }
                 for (index, header) in right_headers.iter().enumerate() {
-                    if key_unset || Some(index) == right_key {
+                    if key_unset {
                         continue;
                     }
                     let selected = self.right_pick_cols.contains(&index);
@@ -247,10 +264,23 @@ impl ExcelLookupApp {
             left_headers.len(),
             right_headers.len(),
         );
-        let (note, tone) = if output_ready {
-            ("配置会保留，可随时返回调整", NoteTone::Normal)
-        } else {
+        let key_output_ready = has_key_output(
+            self.left_key_col.as_slice(),
+            self.right_key_col.as_slice(),
+            self.left_pick_cols.as_deref(),
+            &self.right_pick_cols,
+            left_headers.len(),
+            right_headers.len(),
+        );
+        let (note, tone) = if !output_ready {
             ("请至少选择一个 A 或 B 输出列", NoteTone::Warn)
+        } else if !key_output_ready {
+            (
+                "请至少保留一列匹配列在输出中（A 匹配列或 B 匹配列）",
+                NoteTone::Warn,
+            )
+        } else {
+            ("配置会保留，可随时返回调整", NoteTone::Normal)
         };
         Self::action_row(ui, note, tone, |ui| {
             // join 期间置灰:世代号只保证旧结果不落回,不会停下旧线程的计算。
@@ -260,7 +290,13 @@ impl ExcelLookupApp {
             } else {
                 "执行连接并查看结果  →"
             };
-            if Self::primary_button(ui, label, 180.0, keys_ready && output_ready && !busy).clicked()
+            if Self::primary_button(
+                ui,
+                label,
+                180.0,
+                keys_ready && output_ready && key_output_ready && !busy,
+            )
+            .clicked()
             {
                 self.run_join(ui.ctx().clone());
             }

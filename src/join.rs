@@ -1,6 +1,6 @@
 //! Join 引擎:实现 VLOOKUP(left join)与 inner join
 //!
-//! 左右表分别选择输出列;左表默认全部输出,匹配键不必包含在输出列中。
+//! 左右表分别选择输出列;A 匹配列默认带出、B 匹配列默认不带出,两侧至少保留一列匹配列在输出中(由 UI 与 worker 用 has_key_output 把关,join 本身不强制)。
 //! 键支持多列复合;归一化可配置:数字/文本互认+trim、中文/英文括号互认、案号分支后缀忽略。
 
 #[cfg(test)]
@@ -121,6 +121,18 @@ impl JoinSpec {
             right_col_count,
         )
     }
+
+    /// 输出里是否至少保留了一列匹配列。判据与 UI 共用 [`has_key_output`]。
+    pub fn has_key_output(&self, left_col_count: usize, right_col_count: usize) -> bool {
+        has_key_output(
+            &self.left_keys,
+            &self.right_keys,
+            self.left_pick.as_deref(),
+            &self.right_pick,
+            left_col_count,
+            right_col_count,
+        )
+    }
 }
 
 /// 解析左表输出列:越界下标按左表实际列数丢弃,顺序沿用调用方给定的顺序。
@@ -156,6 +168,25 @@ pub fn has_output_columns(
         || right_pick
             .iter()
             .any(|&column| column < right_col_count)
+}
+
+/// 输出里是否至少保留了一列匹配列(A 匹配列或 B 匹配列)。
+///
+/// A 侧按 [`resolve_left_pick`] 解析后判断;B 侧只认 `right_pick` 里的合法下标。
+/// 越界的键列下标视为未输出。UI 的「执行连接」按钮与后台线程共用此判据。
+pub fn has_key_output(
+    left_keys: &[usize],
+    right_keys: &[usize],
+    left_pick: Option<&[usize]>,
+    right_pick: &[usize],
+    left_col_count: usize,
+    right_col_count: usize,
+) -> bool {
+    let left_out = resolve_left_pick(left_pick, left_col_count);
+    left_keys.iter().any(|k| left_out.contains(k))
+        || right_keys
+            .iter()
+            .any(|k| *k < right_col_count && right_pick.contains(k))
 }
 
 /// `JoinedRow::right_row` 的未命中哨兵。
@@ -883,10 +914,6 @@ mod tests {
                 );
             }
         }
-        assert_eq!(
-            left.cell(0, 1),
-            Some(&CellValue::from("台88（2025）执388号之十二"))
-        );
         assert_eq!(result.table.cell(&left, &right, 0, 3), None);
     }
 
@@ -971,6 +998,42 @@ mod tests {
                 !resolve_left_pick(join_spec.left_pick.as_deref(), left_cols).is_empty()
             );
         }
+    }
+
+    #[test]
+    fn has_key_output_requires_a_key_column_in_output() {
+        // 键列 lk=0 / rk=0;left_pick 与 right_pick 逐用例覆盖。
+        let spec_with = |left_pick: Option<Vec<usize>>, right_pick: Vec<usize>| {
+            let mut join_spec = spec(JoinType::Left, 0, 0, 0, KeyMode::EXACT);
+            join_spec.left_pick = left_pick;
+            join_spec.right_pick = right_pick;
+            join_spec
+        };
+        // A 默认全选(None)含键列 → 有匹配列输出
+        assert!(spec_with(None, vec![1]).has_key_output(2, 2));
+        // A 显式空选 + B 只输出非键列 → 没有任何匹配列输出
+        assert!(!spec_with(Some(vec![]), vec![1]).has_key_output(2, 2));
+        // B 键列补进 right_pick → 满足
+        assert!(spec_with(Some(vec![]), vec![0, 1]).has_key_output(2, 2));
+        // A、B 输出列都不含各自键列 → 不满足
+        assert!(!spec_with(Some(vec![1]), vec![1]).has_key_output(2, 2));
+        // A 显式选了键列即满足,B 侧可以为空
+        assert!(spec_with(Some(vec![0]), vec![]).has_key_output(2, 2));
+        // 键列下标越界(A 表只有 0 列)→ 视为未输出
+        assert!(!spec_with(Some(vec![0]), vec![]).has_key_output(0, 2));
+        // B 键列越界同理
+        assert!(!spec_with(Some(vec![]), vec![0]).has_key_output(2, 0));
+        // 方法与自由函数判定一致
+        let join_spec = spec_with(Some(vec![]), vec![1]);
+        assert_eq!(
+            join_spec.has_key_output(2, 2),
+            has_key_output(&[0], &[0], Some(&[]), &[1], 2, 2)
+        );
+        let join_spec = spec_with(Some(vec![0]), vec![]);
+        assert_eq!(
+            join_spec.has_key_output(2, 2),
+            has_key_output(&[0], &[0], Some(&[0]), &[], 2, 2)
+        );
     }
 
     #[test]

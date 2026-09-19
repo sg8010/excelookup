@@ -18,8 +18,8 @@ use egui_extras::{Column, TableBuilder};
 
 use excelookup_lib::export::{ExportPhase, ExportProgress};
 use excelookup_lib::join::{
-    JoinLimitExceeded, JoinSpec, JoinType, JoinedTable, KeyMode, has_output_columns,
-    join_with_limit,
+    JoinLimitExceeded, JoinSpec, JoinType, JoinedTable, KeyMode, has_key_output,
+    has_output_columns, join_with_limit,
 };
 use excelookup_lib::model::{CellValue, Table};
 use excelookup_lib::read_xlsx::{ReadOptions, SheetTable};

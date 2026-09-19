@@ -650,21 +650,13 @@ impl ExcelLookupApp {
         };
         let lk = lk.min(lc.saturating_sub(1));
         let rk = rk.min(rc.saturating_sub(1));
-        let rp: Vec<usize> = self
-            .right_pick_cols
-            .iter()
-            .copied()
-            .filter(|&c| c < rc)
-            .collect();
-
-        // 原样透传 UI 的选择(含越界项),统一由 JoinSpec 侧解析:这里再过滤一遍
-        // 会与 resolved_left_pick 出现两套口径。
+        // 两侧输出列选择原样传入，由 lib 按实际列数过滤越界项。
         let spec = JoinSpec {
             join_type: self.join_type,
             left_keys: vec![lk],
             right_keys: vec![rk],
             left_pick: self.left_pick_cols.clone(),
-            right_pick: rp,
+            right_pick: self.right_pick_cols.clone(),
             key_mode: self.key_mode(),
             expand_dup: self.expand_dup,
         };
@@ -674,6 +666,17 @@ impl ExcelLookupApp {
             let result_id = self.next_result_id();
             self.result = Some(JoinOutcome::error(
                 "请至少选择一个 A 或 B 输出列".into(),
+                self.join_type,
+                result_id,
+            ));
+            self.step = WorkflowStep::Configure;
+            return;
+        }
+        // 与配置页共用 join::has_key_output
+        if !spec.has_key_output(lc, rc) {
+            let result_id = self.next_result_id();
+            self.result = Some(JoinOutcome::error(
+                "请至少保留一列匹配列在输出中（A 匹配列或 B 匹配列）".into(),
                 self.join_type,
                 result_id,
             ));
