@@ -23,6 +23,7 @@ impl ExcelLookupApp {
         KeyMode {
             number_text: self.normalize_keys,
             brackets: self.bracket_fold,
+            case_suffix: self.case_suffix,
         }
     }
 

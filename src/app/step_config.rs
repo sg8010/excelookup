@@ -168,6 +168,15 @@ impl ExcelLookupApp {
                     );
                 }
             });
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                Self::toggle_switch(ui, &mut self.case_suffix, "忽略案号分支后缀");
+                ui.label(
+                    egui::RichText::new("匹配时忽略末尾的之一、之十二等，保留原值")
+                        .size(12.0)
+                        .color(Self::soft()),
+                );
+            });
         });
 
         Self::action_row(ui, "配置会保留，可随时返回调整", |ui| {

@@ -1,7 +1,7 @@
 //! Join 引擎:实现 VLOOKUP(left join)与 inner join
 //!
 //! 左表按「原列」输出;右表只输出「取值列」,避免键列重复。
-//! 键支持多列复合;归一化可配置:数字/文本互认+trim、中文/英文括号互认。
+//! 键支持多列复合;归一化可配置:数字/文本互认+trim、中文/英文括号互认、案号分支后缀忽略。
 
 #[cfg(test)]
 use std::borrow::Cow;
@@ -47,13 +47,15 @@ impl JoinType {
     }
 }
 
-/// 键归一化策略(两个独立开关,可任意组合)
+/// 键归一化策略(独立开关,可任意组合)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyMode {
     /// 宽松匹配:数字 1 与文本 "1" 视为相同,并 trim 首尾空白
     pub number_text: bool,
     /// 括号归一化:中文括号(（）【】｛｝)与英文括号([]{})互认
     pub brackets: bool,
+    /// 忽略紧接“号”的末尾中文数字分支后缀，如之一、（之十二）。
+    pub case_suffix: bool,
 }
 
 impl KeyMode {
@@ -61,20 +63,23 @@ impl KeyMode {
     pub const EXACT: Self = Self {
         number_text: false,
         brackets: false,
+        case_suffix: false,
     };
     /// 仅数字/文本互认 + trim(不带括号归一化)
     pub const NORMALIZE: Self = Self {
         number_text: true,
         brackets: false,
+        case_suffix: false,
     };
 }
 
 impl Default for KeyMode {
     fn default() -> Self {
-        // 默认:两开关全开(数字/文本互认 + 括号归一化)
+        // 默认开启数字/文本互认与括号归一化；案号专用清理需显式启用。
         Self {
             number_text: true,
             brackets: true,
+            case_suffix: false,
         }
     }
 }
@@ -382,6 +387,32 @@ fn append_folded_text(out: &mut String, text: &str) {
     out.push_str(&text[segment_start..]);
 }
 
+/// 只借用基础案号切片，不修改原值。仅接受末尾中文数字，括号必须成对；
+/// 不解析数字大小或校验中文数字语法，也不处理阿拉伯数字与复合后缀。
+fn strip_case_suffix(text: &str) -> &str {
+    let (body, opening) = if let Some(body) = text.strip_suffix('）') {
+        (body, Some('（'))
+    } else if let Some(body) = text.strip_suffix(')') {
+        (body, Some('('))
+    } else {
+        (text, None)
+    };
+    let prefix = body.trim_end_matches(|c: char| "零〇一二三四五六七八九十百千万两".contains(c));
+    if prefix.len() == body.len() {
+        return text;
+    }
+    let Some(mut base) = prefix.strip_suffix('之') else {
+        return text;
+    };
+    if let Some(opening) = opening {
+        let Some(unwrapped) = base.strip_suffix(opening) else {
+            return text;
+        };
+        base = unwrapped;
+    }
+    if base.ends_with('号') { base } else { text }
+}
+
 /// 向目标 key 追加一个带类型前缀的片段，返回该片段是否非空。
 ///
 /// 单列路径会直接调用这个函数，不经过 `Vec<String> + join`。正文 trim
@@ -402,6 +433,11 @@ fn append_key_part(out: &mut String, value: &CellValue, mode: KeyMode) -> bool {
         }
         CellValue::Text(s) => {
             let body = if mode.number_text { s.trim() } else { s };
+            let body = if mode.case_suffix {
+                strip_case_suffix(body)
+            } else {
+                body
+            };
             let prefix = if mode.number_text { "V:" } else { "S:" };
             out.reserve(prefix.len() + body.len());
             out.push_str(prefix);
@@ -1031,6 +1067,110 @@ mod tests {
     }
 
     #[test]
+    fn case_suffix_supported_forms_and_boundaries() {
+        let base = "台88（2025）执388号";
+        for suffix in [
+            "之一",
+            "之十二",
+            "之二十三",
+            "之一百零二",
+            "之两千〇一",
+            "之一万",
+            "（之十二）",
+            "(之十二)",
+        ] {
+            let original = format!("{base}{suffix}");
+            assert_eq!(strip_case_suffix(&original), base, "{original}");
+        }
+        for suffix in [
+            "",
+            "之",
+            "之12",
+            "之壹",
+            "之十二附注",
+            "（之十二)",
+            "(之十二）",
+            "（之十二",
+            "之十二）",
+            "之一（之二）",
+        ] {
+            let original = format!("{base}{suffix}");
+            assert_eq!(strip_case_suffix(&original), original, "{original}");
+        }
+        assert_eq!(strip_case_suffix("普通文本之十二"), "普通文本之十二");
+    }
+
+    #[test]
+    fn case_suffix_join_preserves_left_rows_and_original_values() {
+        let a = tbl(
+            &["文书号"],
+            &[
+                &["台88（2025）民初232号之一"],
+                &["台88（2025）民初232号之十二"],
+            ],
+        );
+        let b = tbl(
+            &["案号", "承办部门"],
+            &[&["台88（2025）民初232号", "某部门"]],
+        );
+        let mode = KeyMode {
+            case_suffix: true,
+            ..KeyMode::EXACT
+        };
+        for expand_dup in [false, true] {
+            let mut sp = spec(JoinType::Left, 0, 0, 1, mode);
+            sp.expand_dup = expand_dup;
+            let result = join_with_limit(&a, &b, &sp, Some(2)).unwrap();
+            assert_eq!(hits(&result), vec![true, true]);
+            for row in 0..2 {
+                assert_eq!(
+                    joined_cell(&result.table, &a, &b, row, 0),
+                    Some(&a.rows[row][0])
+                );
+                assert_eq!(
+                    joined_cell(&result.table, &a, &b, row, 1),
+                    Some(&b.rows[0][1])
+                );
+            }
+        }
+        let disabled = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::default()));
+        assert_eq!(hits(&disabled), vec![false, false]);
+    }
+
+    #[test]
+    fn case_suffix_cleans_both_sides_and_respects_limits() {
+        let a = tbl(&["案号"], &[&[" 台88（2025）执388号之十二 "]]);
+        let b = tbl(
+            &["案号", "承办部门"],
+            &[
+                &["台88(2025)执388号(之二十三)", "甲"],
+                &["台88(2025)执388号", "乙"],
+            ],
+        );
+        let mode = KeyMode {
+            case_suffix: true,
+            ..KeyMode::default()
+        };
+        let mut sp = spec(JoinType::Left, 0, 0, 1, mode);
+        assert_eq!(
+            estimate_join_rows(&a, &b, &[0], &[0], mode, JoinType::Left, true).output_rows,
+            2
+        );
+        assert!(join_with_limit(&a, &b, &sp, Some(1)).is_err());
+        assert_eq!(
+            hits(&join_with_limit(&a, &b, &sp, Some(2)).unwrap()),
+            vec![true, true]
+        );
+        sp.expand_dup = false;
+        assert_eq!(
+            hits(&join_with_limit(&a, &b, &sp, Some(1)).unwrap()),
+            vec![true]
+        );
+        sp.key_mode.number_text = false;
+        assert_eq!(hits(&join(&a, &b, &sp)), vec![false]);
+    }
+
+    #[test]
     fn bracket_fold_matches_chinese_english() {
         // 开启括号归一化:中文（）与英文 () 互认
         let a = tbl(&["name"], &[&["苹果（红）"]]);
@@ -1038,6 +1178,7 @@ mod tests {
         let m = KeyMode {
             number_text: false,
             brackets: true,
+            case_suffix: false,
         };
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m));
         assert_eq!(r.table.row_count(), 1);
@@ -1047,6 +1188,7 @@ mod tests {
         let m2 = KeyMode {
             number_text: false,
             brackets: false,
+            case_suffix: false,
         };
         let r2 = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m2));
         assert_eq!(r2.table.row_count(), 1);
@@ -1061,6 +1203,7 @@ mod tests {
         let m = KeyMode {
             number_text: false,
             brackets: true,
+            case_suffix: false,
         };
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m));
         assert_eq!(r.table.row_count(), 1);
@@ -1075,6 +1218,7 @@ mod tests {
         let m = KeyMode {
             number_text: false,
             brackets: true,
+            case_suffix: false,
         };
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m));
         assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("x".into())));
@@ -1131,6 +1275,7 @@ mod tests {
         let mode = KeyMode {
             number_text: true,
             brackets: true,
+            case_suffix: false,
         };
         let mut key = String::new();
         let long = vec![CellValue::Text("  很长的键值（A）以及尾部  ".into())];

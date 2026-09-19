@@ -364,6 +364,7 @@ fn run_case(case: Case) {
             KeyData::Brackets => KeyMode {
                 number_text: false,
                 brackets: true,
+                ..KeyMode::EXACT
             },
         },
         expand_dup: case.expand_dup,

@@ -173,6 +173,8 @@ pub struct ExcelLookupApp {
     normalize_keys: bool,
     /// UI 用的括号归一化开关(中文/英文括号互认)
     bracket_fold: bool,
+    /// 匹配时忽略案号末尾的分支后缀,保留原值。
+    case_suffix: bool,
     /// B 同键多行是否全部展开(true=展开成多行,false=只取第一条即 VLOOKUP 语义)
     expand_dup: bool,
     result: Option<JoinOutcome>,
@@ -407,6 +409,7 @@ impl Default for ExcelLookupApp {
             right_pick_cols: vec![],
             normalize_keys: true,
             bracket_fold: true,
+            case_suffix: false,
             expand_dup: true,
             result: None,
             row_filter: None,
