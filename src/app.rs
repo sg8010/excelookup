@@ -7,6 +7,8 @@ mod step_sources;
 mod theme;
 mod workers;
 
+use theme::NoteTone;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +18,8 @@ use egui_extras::{Column, TableBuilder};
 
 use excelookup_lib::export::{ExportPhase, ExportProgress};
 use excelookup_lib::join::{
-    JoinLimitExceeded, JoinSpec, JoinType, JoinedTable, KeyMode, join_with_limit,
+    JoinLimitExceeded, JoinSpec, JoinType, JoinedTable, KeyMode, has_output_columns,
+    join_with_limit,
 };
 use excelookup_lib::model::{CellValue, Table};
 use excelookup_lib::read_xlsx::{ReadOptions, SheetTable};
@@ -168,6 +171,8 @@ pub struct ExcelLookupApp {
     /// None = 未选择(该侧表被替换/切换后需重新选择)
     left_key_col: Option<usize>,
     right_key_col: Option<usize>,
+    /// None 表示默认全选；Some 空列表表示不输出 A 列。
+    left_pick_cols: Option<Vec<usize>>,
     right_pick_cols: Vec<usize>,
     /// UI 用的宽松匹配开关(数字/文本互认 + trim)
     normalize_keys: bool,
@@ -406,6 +411,7 @@ impl Default for ExcelLookupApp {
             join_type: JoinType::Left,
             left_key_col: None,
             right_key_col: None,
+            left_pick_cols: None,
             right_pick_cols: vec![],
             normalize_keys: true,
             bracket_fold: true,

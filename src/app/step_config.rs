@@ -92,6 +92,64 @@ impl ExcelLookupApp {
 
         ui.add_space(13.0);
         Self::sub_panel(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("A 输出列")
+                        .size(13.0)
+                        .strong()
+                        .color(Self::muted()),
+                );
+                ui.label(
+                    egui::RichText::new("默认全选，点击可取消；取消匹配列的输出不影响匹配")
+                        .size(12.0)
+                        .color(Self::soft()),
+                );
+            });
+            ui.add_space(10.0);
+            // 不在渲染期写回 self.left_pick_cols:打开配置页是纯读操作,None(默认全选)
+            // 只在用户真的点了某一列时才变成显式列表。
+            // 默认态不构造列表:选中与否按「已有选择均含该序号」判断,只有真点击时
+            // 才展开成显式 Vec,否则每帧重绘都要生成/克隆整份选择。
+            let explicit = self.left_pick_cols.as_deref();
+            let selected_at = |edited: Option<&Vec<usize>>, index: usize| match edited {
+                Some(columns) => columns.contains(&index),
+                None => explicit.is_none_or(|columns| columns.contains(&index)),
+            };
+            let mut edited: Option<Vec<usize>> = None;
+            ui.horizontal_wrapped(|ui| {
+                for (index, header) in left_headers.iter().enumerate() {
+                    let selected = selected_at(edited.as_ref(), index);
+                    if Self::toggle_chip(ui, header, selected).clicked() {
+                        // 首次编辑时把「当前生效的选择」展开成显式列表,之后的点击
+                        // 都在该列表上增删。
+                        let mut next = edited.take().unwrap_or_else(|| match explicit {
+                            Some(columns) => columns.to_vec(),
+                            None => (0..left_headers.len()).collect(),
+                        });
+                        if selected {
+                            next.retain(|&column| column != index);
+                        } else {
+                            next.push(index);
+                            next.sort_unstable();
+                        }
+                        edited = Some(next);
+                    }
+                }
+                if !has_output_columns(edited.as_deref().or(explicit), &[], left_headers.len(), 0) {
+                    ui.label(
+                        egui::RichText::new("未选择 A 输出列")
+                            .size(12.0)
+                            .color(Self::soft()),
+                    );
+                }
+            });
+            if let Some(edited) = edited {
+                self.left_pick_cols = Some(edited);
+            }
+        });
+
+        ui.add_space(13.0);
+        Self::sub_panel(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("B 输出列").size(13.0).strong().color(Self::muted()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -129,7 +187,7 @@ impl ExcelLookupApp {
                 }
                 if right_key.is_some() && self.right_pick_cols.is_empty() {
                     ui.label(
-                        egui::RichText::new("未选择字段，结果将只有 A 的列")
+                        egui::RichText::new("未选择 B 输出列")
                             .size(12.0)
                             .color(Self::soft()),
                     );
@@ -179,8 +237,22 @@ impl ExcelLookupApp {
             });
         });
 
-        Self::action_row(ui, "配置会保留，可随时返回调整", |ui| {
-            let keys_ready = self.left_key_col.is_some() && self.right_key_col.is_some();
+        // 未选择任何输出列时,把提示写进左侧说明区。action_row 的按钮闭包在宽窗口下
+        // 跑在 right_to_left 布局里(先添加者排最右),放在闭包内会跑到主按钮右侧。
+        let keys_ready = self.left_key_col.is_some() && self.right_key_col.is_some();
+        // 判据与后台线程共用 join::has_output_columns:越界下标的处理只实现一次。
+        let output_ready = has_output_columns(
+            self.left_pick_cols.as_deref(),
+            &self.right_pick_cols,
+            left_headers.len(),
+            right_headers.len(),
+        );
+        let (note, tone) = if output_ready {
+            ("配置会保留，可随时返回调整", NoteTone::Normal)
+        } else {
+            ("请至少选择一个 A 或 B 输出列", NoteTone::Warn)
+        };
+        Self::action_row(ui, note, tone, |ui| {
             // join 期间置灰:世代号只保证旧结果不落回,不会停下旧线程的计算。
             let busy = self.join_active;
             let label = if busy {
@@ -188,15 +260,14 @@ impl ExcelLookupApp {
             } else {
                 "执行连接并查看结果  →"
             };
-            if Self::primary_button(ui, label, 180.0, keys_ready && !busy).clicked() {
+            if Self::primary_button(ui, label, 180.0, keys_ready && output_ready && !busy).clicked()
+            {
                 self.run_join(ui.ctx().clone());
             }
             if Self::secondary_button(ui, "上一步", 72.0).clicked() {
                 self.go_to_step(WorkflowStep::Sources);
             }
-            if self.result.is_some()
-                && Self::secondary_button(ui, "清空结果", 80.0).clicked()
-            {
+            if self.result.is_some() && Self::secondary_button(ui, "清空结果", 80.0).clicked() {
                 self.clear_result();
             }
         });

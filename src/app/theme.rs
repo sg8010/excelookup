@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// 底部说明区文案的配色。
+///
+/// 用枚举而不是 `bool`,避免 `action_row(ui, note, false, |ui| ...)` 这种在调用点
+/// 看不出含义(且容易传反)的布尔参数。
+pub(crate) enum NoteTone {
+    /// 常规提示(青色)。
+    Normal,
+    /// 状态警示:当前配置还不能执行(琥珀色)。
+    Warn,
+}
+
 impl ExcelLookupApp {
     // ---------- 颜色与基础组件 ----------
 
@@ -154,7 +165,17 @@ impl ExcelLookupApp {
         )
     }
 
-    pub(crate) fn action_row(ui: &mut egui::Ui, note: &str, add_buttons: impl FnOnce(&mut egui::Ui)) {
+    /// 底部的说明 + 操作行。
+    ///
+    /// `tone` 决定左侧说明的配色:`Warn` 用于「当前配置还不能执行」这类状态文案。
+    /// 状态提示要放在说明区:宽窗口下按钮闭包跑在 `right_to_left` 布局里,先添加的
+    /// 控件排在最右,写在闭包里的提示会跑到主按钮右侧,读起来像按钮的附属说明。
+    pub(crate) fn action_row(
+        ui: &mut egui::Ui,
+        note: &str,
+        tone: NoteTone,
+        add_buttons: impl FnOnce(&mut egui::Ui),
+    ) {
         ui.add_space(17.0);
         ui.separator();
         ui.add_space(15.0);
@@ -162,34 +183,38 @@ impl ExcelLookupApp {
         let compact = ui.available_width() < 620.0;
         if compact {
             ui.horizontal_wrapped(|ui| {
-                Self::action_note(ui, note);
+                Self::action_note(ui, note, tone);
                 ui.add_space(17.0);
                 add_buttons(ui);
             });
         } else {
             ui.horizontal(|ui| {
-                Self::action_note(ui, note);
+                Self::action_note(ui, note, tone);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add_buttons);
             });
         }
     }
 
-    pub(crate) fn action_note(ui: &mut egui::Ui, note: &str) {
+    pub(crate) fn action_note(ui: &mut egui::Ui, note: &str, tone: NoteTone) {
+        let (accent, text) = match tone {
+            NoteTone::Normal => (Self::teal(), Self::muted()),
+            NoteTone::Warn => (Self::amber(), Self::amber()),
+        };
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
             ui.painter().circle_stroke(
                 rect.center(),
                 5.0,
-                Stroke::new(1.4, Self::teal()),
+                Stroke::new(1.4, accent),
             );
             ui.painter().line_segment(
                 [
                     egui::pos2(rect.center().x, rect.center().y),
                     egui::pos2(rect.center().x + 2.5, rect.center().y + 2.0),
                 ],
-                Stroke::new(1.2, Self::teal()),
+                Stroke::new(1.2, accent),
             );
-            ui.label(egui::RichText::new(note).size(13.0).color(Self::muted()));
+            ui.label(egui::RichText::new(note).size(13.0).color(text));
         });
     }
 

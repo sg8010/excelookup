@@ -1,5 +1,7 @@
 //! 端到端集成测试:真实 .xlsx 文件走 造数 → 读 → join → 导出 → 读回验证
 
+mod support;
+
 use std::path::PathBuf;
 
 use rust_xlsxwriter::Workbook;
@@ -8,6 +10,13 @@ use excelookup_lib::export::write_joined_xlsx;
 use excelookup_lib::join::{join, JoinSpec, JoinType, KeyMode};
 use excelookup_lib::model::CellValue;
 use excelookup_lib::read_xlsx::{read_sheet_opts, read_workbook, read_workbook_opts, ReadOptions};
+
+use support::TempDir;
+
+/// 本文件独占的临时目录:名字带用例 tag,离开作用域自动删除。
+fn test_dir(tag: &str) -> TempDir {
+    TempDir::new("excelookup-it", tag)
+}
 
 /// 生成一个临时 xlsx:两个 sheet,left 与 right
 fn make_wb(path: &PathBuf) {
@@ -44,9 +53,9 @@ fn make_wb(path: &PathBuf) {
 
 #[test]
 fn end_to_end_left_join_real_xlsx() {
-    let dir = std::env::temp_dir();
-    let src = dir.join("exlook_it_left.xlsx");
-    let out = dir.join("exlook_it_result.xlsx");
+    let dir = test_dir("left");
+    let src = dir.join("left.xlsx");
+    let out = dir.join("result.xlsx");
     make_wb(&src);
 
     // 1. 读两个 sheet
@@ -66,6 +75,7 @@ fn end_to_end_left_join_real_xlsx() {
         join_type: JoinType::Left,
         left_keys: vec![0],
         right_keys: vec![0],
+        left_pick: None,
         right_pick: vec![1],
         key_mode: KeyMode::NORMALIZE,
         expand_dup: true,
@@ -98,16 +108,13 @@ fn end_to_end_left_join_real_xlsx() {
     assert_eq!(t2.row_count(), 3);
     assert_eq!(t2.cell(0, 2), Some(&CellValue::Text("工程部".into())));
     assert_eq!(t2.cell(1, 2), Some(&CellValue::Empty));
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&out);
 }
 
 #[test]
 fn end_to_end_inner_join_real_xlsx() {
-    let dir = std::env::temp_dir();
-    let src = dir.join("exlook_it_inner.xlsx");
-    let out = dir.join("exlook_it_inner_result.xlsx");
+    let dir = test_dir("inner");
+    let src = dir.join("inner.xlsx");
+    let out = dir.join("inner_result.xlsx");
     make_wb(&src);
 
     let sheets = read_workbook(&src).unwrap();
@@ -118,6 +125,7 @@ fn end_to_end_inner_join_real_xlsx() {
         join_type: JoinType::Inner,
         left_keys: vec![0],
         right_keys: vec![0],
+        left_pick: None,
         right_pick: vec![1],
         key_mode: KeyMode::NORMALIZE,
         expand_dup: true,
@@ -128,16 +136,13 @@ fn end_to_end_inner_join_real_xlsx() {
     write_joined_xlsx(&res.table, &left, &right, &out).unwrap();
     let back = read_workbook(&out).unwrap();
     assert_eq!(back[0].1.row_count(), 2);
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&out);
 }
 
 /// 同一 Excel 文件的两个 sheet 互 join(订单表 + 客户表)
 #[test]
 fn end_to_end_same_file_two_sheets() {
-    let dir = std::env::temp_dir();
-    let path = dir.join("exlook_it_samefile.xlsx");
+    let dir = test_dir("samefile");
+    let path = dir.join("samefile.xlsx");
 
     // 造文件:sheet1 订单,sheet2 客户
     {
@@ -186,6 +191,7 @@ fn end_to_end_same_file_two_sheets() {
         join_type: JoinType::Left,
         left_keys: vec![1], // 客户列
         right_keys: vec![0],
+        left_pick: None,
         right_pick: vec![1], // 城市
         key_mode: KeyMode::EXACT,
         expand_dup: true,
@@ -207,14 +213,14 @@ fn end_to_end_same_file_two_sheets() {
         Some(&CellValue::Empty)
     );
     assert_eq!(res.left_matched, 2);
-
-    let _ = std::fs::remove_file(&path);
 }
 
 /// 首行是合并单元格大标题、第二行才是列名:指定列名行后应跳过标题行
 #[test]
 fn end_to_end_header_row_skips_merged_title() {
-    let path = std::env::temp_dir().join("exlook_it_title.xlsx");
+    // 目录守卫必须绑定:临时值会在语句结束时 Drop,连带把目录删掉。
+    let dir = test_dir("title");
+    let path = dir.join("title.xlsx");
     {
         let mut wb = Workbook::new();
         let s = wb.add_worksheet();
@@ -259,6 +265,7 @@ fn end_to_end_header_row_skips_merged_title() {
     let spec = JoinSpec {
         left_keys: vec![0],
         right_keys: vec![0],
+        left_pick: None,
         right_pick: vec![2],
         join_type: JoinType::Left,
         key_mode: KeyMode::NORMALIZE,
@@ -269,14 +276,13 @@ fn end_to_end_header_row_skips_merged_title() {
     assert_eq!(res.table.headers, vec!["id", "名称", "金额", "金额"]);
     assert_eq!(res.table.row_count(), 3);
     assert_eq!(res.left_matched, 3);
-
-    let _ = std::fs::remove_file(&path);
 }
 
 /// 列名行按工作表各记一个:同一个工作簿里两个 sheet 结构不同,互不影响
 #[test]
 fn end_to_end_header_rows_are_per_sheet() {
-    let path = std::env::temp_dir().join("exlook_it_per_sheet.xlsx");
+    let dir = test_dir("per_sheet");
+    let path = dir.join("per_sheet.xlsx");
     {
         let mut wb = Workbook::new();
         // sheet1:首行合并大标题,列名在第 2 行
@@ -335,6 +341,121 @@ fn end_to_end_header_rows_are_per_sheet() {
     assert_eq!(sheets[0].used_header_row, Some(1));
     assert_eq!(sheets[1].used_header_row, Some(0));
     assert_eq!(sheets[1].table.headers, vec!["id", "城市"]);
+}
 
-    let _ = std::fs::remove_file(&path);
+#[test]
+fn selected_left_output_columns_export_without_match_key() {
+    let dir = test_dir("selected_left");
+    let src = dir.join("selected_left.xlsx");
+    make_wb(&src);
+    let sheets = read_workbook(&src).unwrap();
+    let left = &sheets.iter().find(|(name, _)| name == "left").unwrap().1;
+    let right = &sheets.iter().find(|(name, _)| name == "right").unwrap().1;
+
+    // 勾掉匹配列(0),只输出姓名 + 部门。
+    let spec = JoinSpec {
+        join_type: JoinType::Left,
+        left_keys: vec![0],
+        right_keys: vec![0],
+        left_pick: Some(vec![1]),
+        right_pick: vec![1],
+        key_mode: KeyMode::NORMALIZE,
+        expand_dup: true,
+    };
+    let result = join(left, right, &spec);
+    let out = dir.join("without_key.xlsx");
+    write_joined_xlsx(&result.table, left, right, &out).unwrap();
+    let back = read_workbook(&out).unwrap();
+    let actual = &back[0].1;
+    assert_eq!(actual.headers, ["姓名", "部门"]);
+    assert_eq!(actual.rows, result.table.materialize(left, right).rows);
+    assert_eq!(actual.row_count(), 3);
+    assert_eq!(actual.cell(0, 0), Some(&CellValue::from("张三")));
+    assert_eq!(actual.cell(0, 1), Some(&CellValue::from("工程部")));
+    assert_eq!(actual.cell(1, 1), Some(&CellValue::Empty));
+
+    // 保留匹配列:输出多一列 id,后两列的值与上面一致——证明差异只在匹配列本身。
+    let kept = JoinSpec {
+        left_pick: Some(vec![0, 1]),
+        ..spec
+    };
+    let kept_result = join(left, right, &kept);
+    let kept_out = dir.join("with_key.xlsx");
+    write_joined_xlsx(&kept_result.table, left, right, &kept_out).unwrap();
+    let kept_back = read_workbook(&kept_out).unwrap();
+    let kept_actual = &kept_back[0].1;
+    assert_eq!(kept_actual.headers, ["id", "姓名", "部门"]);
+    assert_eq!(kept_actual.cell(0, 0), Some(&CellValue::from("1")));
+    for row in 0..actual.row_count() {
+        assert_eq!(kept_actual.cell(row, 1), actual.cell(row, 0));
+        assert_eq!(kept_actual.cell(row, 2), actual.cell(row, 1));
+    }
+}
+
+/// A 输出列一列都不要:结果只剩 B 列(仍能正常导出并在 Excel 里打开)。
+#[test]
+fn zero_left_output_columns_export_only_right_columns() {
+    let dir = test_dir("zero_left");
+    let src = dir.join("zero_left.xlsx");
+    let out = dir.join("zero_left_result.xlsx");
+    make_wb(&src);
+    let sheets = read_workbook(&src).unwrap();
+    let left = &sheets.iter().find(|(name, _)| name == "left").unwrap().1;
+    let right = &sheets.iter().find(|(name, _)| name == "right").unwrap().1;
+    let spec = JoinSpec {
+        join_type: JoinType::Left,
+        left_keys: vec![0],
+        right_keys: vec![0],
+        left_pick: Some(vec![]),
+        right_pick: vec![1],
+        key_mode: KeyMode::NORMALIZE,
+        expand_dup: true,
+    };
+    let result = join(left, right, &spec);
+    // 空 left_pick 仍算「有输出列」(B 侧还有),UI 不会拦这个配置。
+    assert!(spec.has_output_columns(left.col_count(), right.col_count()));
+    assert_eq!(result.table.headers, ["部门"]);
+    assert_eq!(result.left_matched, 2);
+    write_joined_xlsx(&result.table, left, right, &out).unwrap();
+    let back = read_workbook(&out).unwrap();
+    let actual = &back[0].1;
+    assert_eq!(actual.headers, ["部门"]);
+    // 内存结果保留 3 行,其中未命中行的输出全空;读取器不保留全空行,因此读回 2 行。
+    assert_eq!(result.table.row_count(), 3);
+    assert_eq!(actual.row_count(), 2);
+    assert_eq!(actual.cell(0, 0), Some(&CellValue::from("工程部")));
+    assert_eq!(actual.cell(1, 0), Some(&CellValue::from("产品部")));
+}
+
+/// 全部越界的 A 输出列等于没选:导出侧不出现空列。
+#[test]
+fn out_of_range_left_output_columns_export_without_empty_columns() {
+    let dir = test_dir("oob_left");
+    let src = dir.join("oob_left.xlsx");
+    let out = dir.join("oob_left_result.xlsx");
+    make_wb(&src);
+    let sheets = read_workbook(&src).unwrap();
+    let left = &sheets.iter().find(|(name, _)| name == "left").unwrap().1;
+    let right = &sheets.iter().find(|(name, _)| name == "right").unwrap().1;
+    let spec = JoinSpec {
+        join_type: JoinType::Left,
+        left_keys: vec![0],
+        right_keys: vec![0],
+        left_pick: Some(vec![77, 88]),
+        right_pick: vec![1],
+        key_mode: KeyMode::NORMALIZE,
+        expand_dup: true,
+    };
+    let result = join(left, right, &spec);
+    assert_eq!(result.table.headers, ["部门"]);
+    write_joined_xlsx(&result.table, left, right, &out).unwrap();
+    let back = read_workbook(&out).unwrap();
+    let actual = &back[0].1;
+    assert_eq!(actual.headers, ["部门"]);
+    assert_eq!(actual.col_count(), 1);
+    // 内存结果保留 3 行,其中未命中行的输出全空;读取器不保留全空行,因此读回 2 行。
+    assert_eq!(result.table.row_count(), 3);
+    assert_eq!(actual.row_count(), 2);
+    assert_eq!(actual.cell(0, 0), Some(&CellValue::from("工程部")));
+    assert_eq!(actual.cell(1, 0), Some(&CellValue::from("产品部")));
 }

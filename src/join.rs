@@ -1,6 +1,6 @@
 //! Join 引擎:实现 VLOOKUP(left join)与 inner join
 //!
-//! 左表按「原列」输出;右表只输出「取值列」,避免键列重复。
+//! 左右表分别选择输出列;左表默认全部输出,匹配键不必包含在输出列中。
 //! 键支持多列复合;归一化可配置:数字/文本互认+trim、中文/英文括号互认、案号分支后缀忽略。
 
 #[cfg(test)]
@@ -92,12 +92,70 @@ pub struct JoinSpec {
     pub left_keys: Vec<usize>,
     /// 右表键列下标
     pub right_keys: Vec<usize>,
+    /// 左表输出列下标。None 表示沿用默认(输出左表全部列),与「Some 恰好列出全部
+    /// 列」行为完全等价;Some 空列表表示左表一列都不输出。越界项在 `run_join` 里
+    /// 按左表实际列数丢弃。
+    pub left_pick: Option<Vec<usize>>,
     /// 右表取值列下标(结果中仅这些列来自右表)
     pub right_pick: Vec<usize>,
     pub key_mode: KeyMode,
     /// 右表同键多行时是否全部展开。true=逐行展开(VLOOKUP 的重复键也取全);
     /// false=只取第一条(经典 VLOOKUP 语义),避免结果行数爆炸。
     pub expand_dup: bool,
+}
+
+impl JoinSpec {
+    /// 解析出真正生效的左表输出列:越界下标按左表列数丢弃,顺序沿用调用方给定的顺序。
+    ///
+    /// `None`(默认)与「列出全部列」得到同一结果,`Some(&[])` 得到空列表。
+    pub fn resolved_left_pick(&self, left_col_count: usize) -> Vec<usize> {
+        resolve_left_pick(self.left_pick.as_deref(), left_col_count)
+    }
+
+    /// 结果表是否至少有一列输出。判据与 UI 共用 [`has_output_columns`]。
+    pub fn has_output_columns(&self, left_col_count: usize, right_col_count: usize) -> bool {
+        has_output_columns(
+            self.left_pick.as_deref(),
+            &self.right_pick,
+            left_col_count,
+            right_col_count,
+        )
+    }
+}
+
+/// 解析左表输出列:越界下标按左表实际列数丢弃,顺序沿用调用方给定的顺序。
+///
+/// `None`(默认)展开成「左表全部列」。
+pub fn resolve_left_pick(left_pick: Option<&[usize]>, left_col_count: usize) -> Vec<usize> {
+    match left_pick {
+        None => (0..left_col_count).collect(),
+        Some(columns) => columns
+            .iter()
+            .copied()
+            .filter(|&column| column < left_col_count)
+            .collect(),
+    }
+}
+
+/// 结果表是否至少有一列输出。
+///
+/// 左右输出列都为空时 Join 仍能算出命中,但结果没有任何可看/可导出的列。UI 的
+/// 「执行连接」按钮与后台线程必须用同一个判据,否则会出现「按钮可点、点了却报错」。
+/// 越界下标也在这里一并丢弃,调用方不要各自再过滤一遍。
+pub fn has_output_columns(
+    left_pick: Option<&[usize]>,
+    right_pick: &[usize],
+    left_col_count: usize,
+    right_col_count: usize,
+) -> bool {
+    let left_selected = match left_pick {
+        None => left_col_count > 0,
+        Some(columns) => columns.iter().any(|&column| column < left_col_count),
+    };
+    left_selected
+        || right_pick
+            .iter()
+            .any(|&column| column < right_col_count)
 }
 
 /// `JoinedRow::right_row` 的未命中哨兵。
@@ -123,12 +181,13 @@ pub struct JoinedRow {
 /// 在视图存活期间保留这两张源表,并通过 [`JoinedTable::cell`] 读取单元格。
 #[derive(Debug, Clone, Default)]
 pub struct JoinedTable {
-    /// 输出列名:左表全部列 + B 表选中的列。
+    /// 输出列名:A 表选中的列 + B 表选中的列。
     pub headers: Vec<String>,
     /// 每个输出行对应的 A/B 源行号。
     pub rows: Vec<JoinedRow>,
-    /// A 表在输出中的列数。
-    pub left_width: usize,
+    /// 输出中每个 A 列对应的源列号,顺序与 headers 的左半部分一致;其长度即输出中
+    /// 的 A 列数,不再单独保存一份冗余计数。
+    pub left_pick: Vec<usize>,
     /// 输出中每个 B 列对应的源列号,顺序与 headers 的右半部分一致。
     pub right_pick: Vec<usize>,
 }
@@ -162,16 +221,17 @@ impl JoinedTable {
         column: usize,
     ) -> Option<&'a CellValue> {
         let joined_row = self.rows.get(row)?;
-        if column < self.left_width {
+        if column < self.left_pick.len() {
+            let left_column = *self.left_pick.get(column)?;
             return Some(
                 left.rows
                     .get(joined_row.left_row as usize)
-                    .and_then(|source_row| source_row.get(column))
+                    .and_then(|source_row| source_row.get(left_column))
                     .unwrap_or(&EMPTY_CELL),
             );
         }
 
-        let right_column = *self.right_pick.get(column - self.left_width)?;
+        let right_column = *self.right_pick.get(column - self.left_pick.len())?;
         if joined_row.right_row == UNMATCHED_RIGHT_ROW {
             return Some(&EMPTY_CELL);
         }
@@ -207,7 +267,7 @@ impl JoinedTable {
 /// join 结果
 #[derive(Debug, Clone)]
 pub struct JoinResult {
-    /// 输出视图:左表全部列 + 右表取值列,只保存源行引用。
+    /// 输出视图:左表选中列 + 右表取值列,只保存源行引用。
     pub table: JoinedTable,
     pub left_total: usize,
     pub left_matched: usize,
@@ -605,11 +665,14 @@ fn run_join(
         .copied()
         .filter(|&c| c < right.col_count())
         .collect();
-    let mut headers = left.headers.clone();
+    let lp_valid: Vec<usize> = spec.resolved_left_pick(left.col_count());
+    let mut headers: Vec<String> = lp_valid
+        .iter()
+        .map(|&col| left.headers[col].clone())
+        .collect();
     for &col in &rp_valid {
         headers.push(right.headers[col].clone());
     }
-    let left_width = left.col_count();
     let mut joined_rows = Vec::new();
     // 有精确预估值就用它;否则 Left 在「不展开」或「上界已证明不超过上限」
     // 两种情形下每行至少产出一行,按 A 行数预留即可(上界保证不会更大)。
@@ -682,7 +745,7 @@ fn run_join(
             table: JoinedTable {
                 headers,
                 rows: joined_rows,
-                left_width,
+                left_pick: lp_valid,
                 right_pick: rp_valid,
             },
             left_total: left.rows.len(),
@@ -749,6 +812,7 @@ mod tests {
             join_type: jt,
             left_keys: vec![lk],
             right_keys: vec![rk],
+            left_pick: None,
             right_pick: vec![pick],
             key_mode: mode,
             expand_dup: true,
@@ -770,6 +834,143 @@ mod tests {
         (0..result.table.row_count())
             .map(|row| result.table.row_hit(row))
             .collect()
+    }
+
+    #[test]
+    fn selected_left_columns_preserve_order_values_and_row_matches() {
+        let left = tbl(
+            &["姓名", "案号", "金额", "备注"],
+            &[
+                &["甲", "台88（2025）执388号之十二", "100", "保留"],
+                &["乙", "台88（2025）执388号之二", "200", "保留"],
+                &["丙", "未命中", "300", "保留"],
+            ],
+        );
+        let right = tbl(&["案号", "部门"], &[&["台88（2025）执388号", "执行部门"]]);
+        let mut join_spec = spec(
+            JoinType::Left,
+            1,
+            0,
+            1,
+            KeyMode {
+                case_suffix: true,
+                ..KeyMode::EXACT
+            },
+        );
+        // 非连续列且改变输出顺序;匹配键本身不输出。
+        join_spec.left_pick = Some(vec![2, 0, 99]);
+        let result = join(&left, &right, &join_spec);
+        assert_eq!(result.table.headers, ["金额", "姓名", "部门"]);
+        assert_eq!(result.table.left_pick, [2, 0]);
+        assert_eq!(result.left_matched, 2);
+        assert_eq!(hits(&result), [true, true, false]);
+        let expected = tbl(
+            &["金额", "姓名", "部门"],
+            &[
+                &["100", "甲", "执行部门"],
+                &["200", "乙", "执行部门"],
+                &["300", "丙", ""],
+            ],
+        );
+        let mut expected_rows = expected.rows;
+        expected_rows[2][2] = CellValue::Empty;
+        assert_eq!(result.table.materialize(&left, &right).rows, expected_rows);
+        for (row, cells) in expected_rows.iter().enumerate() {
+            for (column, expected) in cells.iter().enumerate() {
+                assert_eq!(
+                    result.table.cell(&left, &right, row, column),
+                    Some(expected)
+                );
+            }
+        }
+        assert_eq!(
+            left.cell(0, 1),
+            Some(&CellValue::from("台88（2025）执388号之十二"))
+        );
+        assert_eq!(result.table.cell(&left, &right, 0, 3), None);
+    }
+
+    #[test]
+    fn no_left_output_columns_still_match_and_expand_duplicates() {
+        let left = tbl(&["id"], &[&["1"], &["2"]]);
+        let right = tbl(&["id", "部门"], &[&["1", "甲"], &["1", "乙"]]);
+        let mut join_spec = spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT);
+        join_spec.left_pick = Some(vec![]);
+        let result = join(&left, &right, &join_spec);
+        assert_eq!(result.table.headers, ["部门"]);
+        assert!(result.table.left_pick.is_empty());
+        assert_eq!(result.table.row_count(), 3);
+        assert_eq!(hits(&result), [true, true, false]);
+        assert_eq!(
+            result.table.materialize(&left, &right).rows,
+            vec![
+                vec![CellValue::from("甲")],
+                vec![CellValue::from("乙")],
+                vec![CellValue::Empty],
+            ]
+        );
+    }
+
+    #[test]
+    fn out_of_range_left_columns_are_dropped_not_kept_as_empty() {
+        // 全部越界 = 左表一列都不输出;这里顺带钉住越界项不会变成一列空列。
+        let left = tbl(&["id", "姓名"], &[&["1", "甲"], &["2", "乙"]]);
+        let right = tbl(&["id", "部门"], &[&["1", "工程部"], &["2", "产品部"]]);
+        let mut join_spec = spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT);
+        join_spec.left_pick = Some(vec![99, 100]);
+        let result = join(&left, &right, &join_spec);
+        assert_eq!(result.table.headers, ["部门"]);
+        assert!(result.table.left_pick.is_empty());
+        assert_eq!(result.table.col_count(), 1);
+        assert_eq!(result.table.row_count(), 2);
+        assert_eq!(result.left_matched, 2);
+        assert_eq!(
+            result.table.materialize(&left, &right).rows,
+            vec![
+                vec![CellValue::from("工程部")],
+                vec![CellValue::from("产品部")],
+            ]
+        );
+        // 输出只剩 B 列:A 侧任何列号都读不到值
+        assert_eq!(result.table.cell(&left, &right, 0, 1), None);
+        // A 侧全越界,但 B 侧还有输出列 → 整体仍有输出
+        assert!(join_spec.has_output_columns(left.col_count(), right.col_count()));
+        let mut no_right = join_spec.clone();
+        no_right.right_pick.clear();
+        assert!(!no_right.has_output_columns(left.col_count(), right.col_count()));
+        assert!(no_right.resolved_left_pick(left.col_count()).is_empty());
+    }
+
+    #[test]
+    fn has_output_columns_matches_resolved_left_pick() {
+        let spec_with = |left_pick: Option<Vec<usize>>, right_pick: Vec<usize>| {
+            let mut join_spec = spec(JoinType::Left, 0, 0, 0, KeyMode::EXACT);
+            join_spec.left_pick = left_pick;
+            join_spec.right_pick = right_pick;
+            join_spec
+        };
+        // None = 默认全输出:A 有列就算有输出
+        assert!(spec_with(None, vec![]).has_output_columns(2, 2));
+        assert!(!spec_with(None, vec![]).has_output_columns(0, 0));
+        // Some 全越界 + B 无可输出列 = 没有任何输出(UI 与 worker 必须同时判否)
+        assert!(!spec_with(Some(vec![7]), vec![]).has_output_columns(2, 2));
+        assert!(!spec_with(Some(vec![7]), vec![9]).has_output_columns(2, 3));
+        // 任一侧还有有效列就算有输出
+        assert!(spec_with(Some(vec![]), vec![1]).has_output_columns(2, 3));
+        assert!(spec_with(Some(vec![1]), vec![]).has_output_columns(2, 3));
+        // 与真正参与 Join 的解析结果一致
+        for (left_pick, left_cols) in [
+            (None, 3),
+            (Some(vec![]), 3),
+            (Some(vec![2, 0, 99]), 3),
+            (Some(vec![99]), 3),
+        ] {
+            let join_spec = spec_with(left_pick, vec![]);
+            assert_eq!(
+                join_spec.has_output_columns(left_cols, 0),
+                !resolve_left_pick(join_spec.left_pick.as_deref(), left_cols).is_empty()
+            );
+        }
     }
 
     #[test]
@@ -995,6 +1196,7 @@ mod tests {
                 join_type: JoinType::Left,
                 left_keys: vec![0, 1],
                 right_keys: vec![0, 1],
+                left_pick: None,
                 right_pick: vec![2],
                 key_mode: KeyMode::EXACT,
                 expand_dup: true,
@@ -1056,6 +1258,7 @@ mod tests {
                 join_type: JoinType::Left,
                 left_keys: vec![0],
                 right_keys: vec![0],
+                left_pick: None,
                 right_pick: vec![1, 2],
                 key_mode: KeyMode::EXACT,
                 expand_dup: true,
@@ -1306,6 +1509,7 @@ mod tests {
                 join_type: JoinType::Left,
                 left_keys: vec![0, 1],
                 right_keys: vec![0, 1],
+                left_pick: None,
                 right_pick: vec![2],
                 key_mode: KeyMode::EXACT,
                 expand_dup: true,

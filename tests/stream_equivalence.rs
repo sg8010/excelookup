@@ -31,6 +31,10 @@ use excelookup_lib::read_xlsx::{
 };
 use rust_xlsxwriter::Workbook;
 
+mod support;
+
+use support::TempDir;
+
 /// 边界用例文件:覆盖读表层所有已知分支
 fn make_edge_workbook(path: &Path) {
     let mut wb = Workbook::new();
@@ -185,19 +189,9 @@ fn make_shift_workbook(path: &Path) {
     wb.save(path).unwrap();
 }
 
-/// 每个用例独占的临时目录(同名残留先清掉)。
-///
-/// 不能让多个用例共用一个目录:并行跑时同名文件会互相踩 ——
-/// `Workbook::save` 是 `File::create`(先把文件截断成 0 字节)再写内容,
-/// 另一边正好 `open_workbook_auto` 就会读到空文件,随机报"无法打开文件"。
-fn test_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "excelookup-stream-tests-{}-{tag}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// 本文件独占的临时目录:名字带用例 tag,离开作用域自动删除。
+fn test_dir(tag: &str) -> TempDir {
+    TempDir::new("excelookup-stream-tests", tag)
 }
 
 fn temp_path(dir: &Path, name: &str) -> PathBuf {

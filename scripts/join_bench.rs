@@ -357,6 +357,8 @@ fn run_case(case: Case) {
         join_type: case.join_type,
         left_keys: vec![0],
         right_keys: vec![0],
+        #[cfg(not(benchmark_baseline))]
+        left_pick: None,
         right_pick: (1..case.width).collect(),
         key_mode: match case.key_data {
             KeyData::Text => KeyMode::EXACT,

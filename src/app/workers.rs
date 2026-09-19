@@ -583,7 +583,7 @@ impl ExcelLookupApp {
     }
 
     /// 某侧的表被替换/切换后调用:清空该侧键列选择(严格版:即使下标合法也不保留,避免
-    /// "下标合法但列含义已变"的静默错误),并清空该侧输出列(若为 B)。另一侧不受影响。
+    /// "下标合法但列含义已变"的静默错误),并恢复该侧输出列默认值(A 全选、B 清空)。另一侧不受影响。
     pub(crate) fn reset_side_on_source_change(&mut self, side: Side) {
         self.invalidate_export();
         // 该侧表要换了:在途 join 算的是换之前的快照,结果已无意义。
@@ -591,6 +591,7 @@ impl ExcelLookupApp {
         match side {
             Side::Left => {
                 self.left_key_col = None;
+                self.left_pick_cols = None;
             }
             Side::Right => {
                 self.right_key_col = None;
@@ -656,14 +657,29 @@ impl ExcelLookupApp {
             .filter(|&c| c < rc)
             .collect();
 
+        // 原样透传 UI 的选择(含越界项),统一由 JoinSpec 侧解析:这里再过滤一遍
+        // 会与 resolved_left_pick 出现两套口径。
         let spec = JoinSpec {
             join_type: self.join_type,
             left_keys: vec![lk],
             right_keys: vec![rk],
+            left_pick: self.left_pick_cols.clone(),
             right_pick: rp,
             key_mode: self.key_mode(),
             expand_dup: self.expand_dup,
         };
+        // 判据与配置页共用 join::has_output_columns:两边各自过滤一遍会
+        // 因为越界下标的处理差异出现「按钮可点、点了却报错」。
+        if !spec.has_output_columns(lc, rc) {
+            let result_id = self.next_result_id();
+            self.result = Some(JoinOutcome::error(
+                "请至少选择一个 A 或 B 输出列".into(),
+                self.join_type,
+                result_id,
+            ));
+            self.step = WorkflowStep::Configure;
+            return;
+        }
 
         // 重复键展开防爆:预估与真正 Join 共享同一个 B 索引；超限只返回诊断，
         // 不再先统计一次再重新构建索引(避免大表重复扫描与重复 key 分配)。
@@ -835,6 +851,7 @@ impl ExcelLookupApp {
         self.left_key_col = None;
         self.right_key_col = None;
         self.right_pick_cols.clear();
+        self.left_pick_cols = None;
         self.drop_result();
         // 作废所有在途加载请求(清空后旧结果不得落回)
         self.load_gen[0] += 1;
@@ -846,13 +863,14 @@ impl ExcelLookupApp {
     /// 对调 A/B 两个数据源(文件+sheet+当前选中)。
     /// 匹配列随对调交换(新 A 沿用原 B 的键列,新 B 沿用原 A 的):整表互换后列号有效性自动
     /// 守恒,即便某侧此前未选择,交换后仍为 None。
-    /// 输出列清空——主从关系已变,带出字段需重新确认。
+    /// 主从关系已变,输出列恢复默认值(A 全选、B 清空)。
     pub(crate) fn swap_sources(&mut self) {
         self.invalidate_export();
         self.invalidate_join();
         std::mem::swap(&mut self.left, &mut self.right);
         std::mem::swap(&mut self.left_key_col, &mut self.right_key_col);
         self.right_pick_cols.clear();
+        self.left_pick_cols = None;
         self.drop_result();
         self.step = WorkflowStep::Sources;
     }

@@ -99,7 +99,7 @@ impl ExcelLookupApp {
         });
 
         let can_next = self.sources_ready();
-        Self::action_row(ui, "文件只在本机读取，不会上传", |ui| {
+        Self::action_row(ui, "文件只在本机读取，不会上传", NoteTone::Normal, |ui| {
             if Self::primary_button(ui, "下一步：配置连接  →", 176.0, can_next).clicked() {
                 self.go_to_step(WorkflowStep::Configure);
             }

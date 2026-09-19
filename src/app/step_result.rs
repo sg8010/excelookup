@@ -232,7 +232,7 @@ impl ExcelLookupApp {
         ui.add_space(8.0);
         self.ui_result_table(ui);
 
-        Self::action_row(ui, "结果已生成，可返回配置调整", |ui| {
+        Self::action_row(ui, "结果已生成，可返回配置调整", NoteTone::Normal, |ui| {
             if Self::secondary_button(ui, "返回配置", 88.0).clicked() {
                 self.go_to_step(WorkflowStep::Configure);
             }
