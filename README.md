@@ -135,6 +135,13 @@ target/x86_64-win7-windows-gnu/release/excelookup.exe
 target/i686-win7-windows-gnu/release/excelookup.exe
 ```
 
+同时会在 `dist/` 下生成带架构后缀的发布副本:
+
+```text
+dist/excelookup-win-x64.exe    # 64 位
+dist/excelookup-win-x32.exe    # 32 位
+```
+
 该构建使用 Rust 官方 `x86_64-win7-windows-gnu` / `i686-win7-windows-gnu`
 target、nightly `build-std`、release `fat LTO` 及
 `rust_xlsxwriter` 的 `constant_memory` 模式，保留文本/图片剪贴板，不引用
