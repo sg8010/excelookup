@@ -7,7 +7,8 @@ mod step_sources;
 mod theme;
 mod workers;
 
-use theme::NoteTone;
+use shell::SIDEBAR_MARGIN;
+use theme::{Icon, NoteTone};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -377,14 +378,6 @@ impl WorkflowStep {
         }
     }
 
-    fn eyebrow(self) -> &'static str {
-        match self {
-            Self::Sources => "第一步 · 数据源",
-            Self::Configure => "第二步 · 连接配置",
-            Self::Result => "第三步 · 结果预览",
-        }
-    }
-
     fn title(self) -> &'static str {
         match self {
             Self::Sources => "先把要连接的两张表放在一起",
@@ -447,31 +440,29 @@ impl Default for ExcelLookupApp {
 impl eframe::App for ExcelLookupApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::left("workflow_sidebar")
-            .exact_size(224.0)
+            .exact_size(Self::SIDEBAR_WIDTH)
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(Self::navy())
-                    .inner_margin(egui::Margin::symmetric(16, 25)),
+                    .fill(Self::surface())
+                    .inner_margin(SIDEBAR_MARGIN),
             )
-            .show(ui, |ui| self.ui_sidebar(ui));
-
-        egui::Panel::top("topbar")
-            .exact_size(66.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(Self::white())
-                    .stroke(Stroke::new(1.0, Self::line()))
-                    .inner_margin(egui::Margin::symmetric(35, 0)),
-            )
-            .show(ui, |ui| self.ui_topbar(ui));
+            .show(ui, |ui| {
+                self.ui_sidebar(ui);
+                Self::paint_sidebar_border(ui);
+            });
 
         egui::CentralPanel::default()
-            // 在导航栏与主工作区之间保留独立的浅色留白，避免内容贴边。
+            // 页面工作区:浅灰底,左右 24 / 上 22 / 下 24 的统一页边距。
             .frame(
                 egui::Frame::new()
                     .fill(Self::canvas())
-                    .inner_margin(egui::Margin::symmetric(16, 0)),
+                    .inner_margin(egui::Margin {
+                        left: 24,
+                        right: 24,
+                        top: 22,
+                        bottom: 24,
+                    }),
             )
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
@@ -537,7 +528,11 @@ fn filter_rows(
     unmatched_rows: usize,
 ) -> FilteredRows {
     let want_hit = matches!(filter, RowFilter::Matched);
-    let selected = if want_hit { matched_rows } else { unmatched_rows };
+    let selected = if want_hit {
+        matched_rows
+    } else {
+        unmatched_rows
+    };
     if selected == 0 {
         return FilteredRows::List(Arc::new(Vec::new()));
     }
@@ -609,23 +604,11 @@ fn open_export_location(path: &Path) -> Result<(), String> {
         let file = path.as_os_str().to_os_string();
         // 这些文件管理器支持选中指定文件;按常见桌面环境依次尝试。
         let selectors = [
-            (
-                "nautilus",
-                vec![OsString::from("--select"), file.clone()],
-            ),
-            (
-                "dolphin",
-                vec![OsString::from("--select"), file.clone()],
-            ),
+            ("nautilus", vec![OsString::from("--select"), file.clone()]),
+            ("dolphin", vec![OsString::from("--select"), file.clone()]),
             ("nemo", vec![OsString::from("--select"), file.clone()]),
-            (
-                "pcmanfm-qt",
-                vec![OsString::from("--select"), file.clone()],
-            ),
-            (
-                "pcmanfm",
-                vec![OsString::from("--select"), file.clone()],
-            ),
+            ("pcmanfm-qt", vec![OsString::from("--select"), file.clone()]),
+            ("pcmanfm", vec![OsString::from("--select"), file.clone()]),
             ("thunar", vec![file.clone()]),
         ];
         for (program, args) in selectors {
@@ -642,11 +625,7 @@ fn open_export_location(path: &Path) -> Result<(), String> {
             .as_os_str()
             .to_os_string();
         if spawn_file_manager("xdg-open", std::slice::from_ref(&directory)).is_ok()
-            || spawn_file_manager(
-                "gio",
-                &[OsString::from("open"), directory],
-            )
-            .is_ok()
+            || spawn_file_manager("gio", &[OsString::from("open"), directory]).is_ok()
         {
             return Ok(());
         }
@@ -688,10 +667,9 @@ fn install_cjk_font(ctx: &egui::Context) {
         if let Ok(bytes) = std::fs::read(path) {
             let mut data = egui::FontData::from_owned(bytes);
             data.index = face_index;
-            fonts.font_data.insert(
-                "system_ui".to_owned(),
-                std::sync::Arc::new(data),
-            );
+            fonts
+                .font_data
+                .insert("system_ui".to_owned(), std::sync::Arc::new(data));
             for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                 let family_fonts = fonts.families.entry(family).or_default();
                 if cfg!(windows) {

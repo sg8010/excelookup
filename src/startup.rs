@@ -480,7 +480,11 @@ fn truncate_line(text: &str) -> String {
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…(本行过长,已省略 {} 字节)", &text[..end], text.len() - end)
+    format!(
+        "{}…(本行过长,已省略 {} 字节)",
+        &text[..end],
+        text.len() - end
+    )
 }
 
 /// 把时间格式化成 `2026-09-15T00:20:23Z`。
@@ -635,7 +639,8 @@ fn show_failure_dialog(diagnostics: &StartupDiagnostics, message: &str) {
     // 不知道在哪的文件更容易让人看懂发生了什么。
     if let Some(log_path) = diagnostics.log_path() {
         let log_arg = log_path.display().to_string();
-        let script = "cat -- \"$0\"; printf '\\n以上是本次启动的完整日志,按回车键关闭。\\n'; read _";
+        let script =
+            "cat -- \"$0\"; printf '\\n以上是本次启动的完整日志,按回车键关闭。\\n'; read _";
         let args = ["-e", "sh", "-c", script, log_arg.as_str()];
         if run_dialog("x-terminal-emulator", &args) {
             diagnostics.write_line("已用 x-terminal-emulator 显示日志");

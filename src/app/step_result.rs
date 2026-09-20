@@ -38,9 +38,13 @@ impl ExcelLookupApp {
                     );
                     return;
                 }
-                ui.label(egui::RichText::new("执行连接后，结果会显示在这里").size(16.0).color(Self::muted()));
+                ui.label(
+                    egui::RichText::new("执行连接后，结果会显示在这里")
+                        .size(16.0)
+                        .color(Self::muted()),
+                );
                 ui.add_space(12.0);
-                if Self::primary_button(ui, "返回连接配置", 130.0, true).clicked() {
+                if Self::primary_button(ui, None, "返回连接配置", 130.0, true).clicked() {
                     self.go_to_step(WorkflowStep::Configure);
                 }
             });
@@ -53,7 +57,7 @@ impl ExcelLookupApp {
             let has_diag = err_text.contains("【数据诊断】");
             let mut go_config = false;
             let mut disable_expand = false;
-            Self::card_frame(Self::surface(), Self::line(), 16).show(ui, |ui| {
+            Self::card(ui, |ui| {
                 ui.set_min_width(600.0);
                 let mut lines = err_text.lines();
                 // 标题行
@@ -75,7 +79,12 @@ impl ExcelLookupApp {
                     }
                     if t.starts_with("【") {
                         ui.add_space(4.0);
-                        ui.label(egui::RichText::new(t).size(13.0).strong().color(Self::ink()));
+                        ui.label(
+                            egui::RichText::new(t)
+                                .size(13.0)
+                                .strong()
+                                .color(Self::ink()),
+                        );
                         ui.add_space(2.0);
                     } else {
                         ui.label(
@@ -87,10 +96,12 @@ impl ExcelLookupApp {
                 }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if Self::primary_button(ui, "返回连接配置", 130.0, true).clicked() {
+                    if Self::primary_button(ui, None, "返回连接配置", 130.0, true).clicked() {
                         go_config = true;
                     }
-                    if has_diag && Self::secondary_button(ui, "关闭重复键展开", 150.0).clicked() {
+                    if has_diag
+                        && Self::secondary_button(ui, None, "关闭重复键展开", 150.0, true).clicked()
+                    {
                         disable_expand = true;
                     }
                 });
@@ -116,13 +127,18 @@ impl ExcelLookupApp {
         let unmatched_rows = result.unmatched_rows;
 
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(join_label).size(13.0).strong().color(Self::blue()));
+            ui.label(
+                egui::RichText::new(join_label)
+                    .size(13.0)
+                    .strong()
+                    .color(Self::blue()),
+            );
             ui.separator();
             ui.label(
                 egui::RichText::new(format!(
                     "A：{left_total} 行 · B：{right_total} 行 · B 命中 {right_matched} 行"
                 ))
-                .size(12.0)
+                .size(13.0)
                 .color(Self::muted()),
             );
         });
@@ -205,24 +221,32 @@ impl ExcelLookupApp {
             None => result.table.row_count(),
         };
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("结果预览").size(15.0).strong().color(Self::ink()));
             ui.label(
-                egui::RichText::new(format!("{shown_total} 行 × {} 列", result.table.col_count()))
-                    .size(12.0)
-                    .color(Self::muted()),
+                egui::RichText::new("结果预览")
+                    .size(15.0)
+                    .strong()
+                    .color(Self::ink()),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "{shown_total} 行 × {} 列",
+                    result.table.col_count()
+                ))
+                .size(13.0)
+                .color(Self::muted()),
             );
             match self.row_filter {
                 Some(RowFilter::Matched) => {
                     ui.label(
                         egui::RichText::new("· 只看已匹配")
-                            .size(12.0)
+                            .size(13.0)
                             .color(Self::teal()),
                     );
                 }
                 Some(RowFilter::Unmatched) => {
                     ui.label(
                         egui::RichText::new("· 只看未命中")
-                            .size(12.0)
+                            .size(13.0)
                             .color(Self::amber()),
                     );
                 }
@@ -232,11 +256,16 @@ impl ExcelLookupApp {
         ui.add_space(8.0);
         self.ui_result_table(ui);
 
-        Self::action_row(ui, "结果已生成，可返回配置调整", NoteTone::Normal, |ui| {
-            if Self::secondary_button(ui, "返回配置", 88.0).clicked() {
-                self.go_to_step(WorkflowStep::Configure);
-            }
-        });
+        Self::action_row(
+            ui,
+            "结果已生成，可返回配置调整",
+            NoteTone::Normal,
+            |ui| {
+                if Self::secondary_button(ui, None, "返回配置", 88.0, true).clicked() {
+                    self.go_to_step(WorkflowStep::Configure);
+                }
+            },
+        );
     }
 
     /// 指标卡;返回整卡可点击的 Response(用于未命中筛选交互)
@@ -263,25 +292,33 @@ impl ExcelLookupApp {
         } else {
             Self::surface()
         };
-        let inner = Self::card_frame(fill, stroke_color, 9)
+        let inner = egui::Frame::new()
+            .inner_margin(egui::Margin::same(12))
+            .fill(fill)
             .stroke(Stroke::new(stroke_w, stroke_color))
+            .corner_radius(CornerRadius::same(Self::CARD_RADIUS))
             .show(ui, |ui| {
                 ui.set_min_height(70.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(label).size(12.0).color(Self::muted()));
+                    ui.label(egui::RichText::new(label).size(13.0).color(Self::muted()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         egui::Frame::new()
                             .inner_margin(egui::Margin::same(4))
                             .fill(accent.gamma_multiply(0.10))
-                            .corner_radius(CornerRadius::ZERO)
+                            .corner_radius(CornerRadius::same(4))
                             .show(ui, |ui| {
                                 ui.label(egui::RichText::new("▦").size(13.0).color(accent));
                             });
                     });
                 });
                 ui.add_space(7.0);
-                ui.label(egui::RichText::new(value).size(24.0).strong().color(Self::ink()));
-                ui.label(egui::RichText::new(note).size(11.0).color(accent));
+                ui.label(
+                    egui::RichText::new(value)
+                        .size(24.0)
+                        .strong()
+                        .color(Self::ink()),
+                );
+                ui.label(egui::RichText::new(note).size(12.0).color(accent));
             });
         let sense = if clickable {
             egui::Sense::click()
@@ -316,12 +353,14 @@ impl ExcelLookupApp {
                             ),
                         )
                     }
-                    ExportPhase::Saving => {
-                        ("正在压缩工作簿…", 0.92, "大数据量保存需要一些时间".to_owned())
-                    }
+                    ExportPhase::Saving => (
+                        "正在压缩工作簿…",
+                        0.92,
+                        "大数据量保存需要一些时间".to_owned(),
+                    ),
                 };
 
-                Self::card_frame(Self::surface(), Self::line(), 13).show(ui, |ui| {
+                Self::card(ui, |ui| {
                     ui.set_min_width(600.0);
                     ui.horizontal(|ui| {
                         ui.label(
@@ -336,15 +375,10 @@ impl ExcelLookupApp {
                                 .color(Self::muted()),
                         );
                     });
-                    ui.add_space(7.0);
-                    ui.add(
-                        egui::ProgressBar::new(fraction)
-                            .desired_width(420.0)
-                            .show_percentage()
-                            .animate(true),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(detail).size(12.0).color(Self::soft()));
+                    ui.add_space(10.0);
+                    Self::progress_bar(ui, fraction, 420.0);
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(detail).size(13.0).color(Self::soft()));
                 });
                 ui.add_space(10.0);
             }
@@ -352,29 +386,30 @@ impl ExcelLookupApp {
                 let path = path.clone();
                 let location_error = self.export_location_error.clone();
                 let mut open_location = false;
-                Self::card_frame(Self::surface(), Self::line(), 13).show(ui, |ui| {
+                Self::card(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new("导出完成，可打开刚保存的工作簿。")
                                 .size(13.0)
                                 .color(Self::blue()),
                         );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if Self::secondary_button(ui, "打开文件位置", 128.0).clicked() {
-                                    open_location = true;
-                                }
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::secondary_button(
+                                ui,
+                                Some(Icon::External),
+                                "打开文件位置",
+                                128.0,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                open_location = true;
+                            }
+                        });
                     });
                     if let Some(error) = &location_error {
                         ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(error)
-                                .size(12.0)
-                                .color(Self::amber()),
-                        );
+                        ui.label(egui::RichText::new(error).size(13.0).color(Self::amber()));
                     }
                 });
                 if open_location {
@@ -442,9 +477,7 @@ impl ExcelLookupApp {
             return;
         }
 
-        let text_h = ui.text_style_height(&egui::TextStyle::Body);
-        let row_h = (text_h + 7.0).max(22.0);
-        let sep_color = Self::line();
+        let sep_color = Self::divider();
         // 横向滚动容器:表格总宽超过视口时可左右滚动查看所有列;
         // Table 内部仍是纵向虚拟滚动(只渲染可见行),性能不受影响。
         egui::ScrollArea::horizontal()
@@ -471,7 +504,7 @@ impl ExcelLookupApp {
                 }
 
                 builder
-                    .header(row_h, |mut header| {
+                    .header(Self::TABLE_HEADER_HEIGHT, |mut header| {
                         for name in &headers {
                             header.col(|ui| {
                                 ui.label(
@@ -484,7 +517,7 @@ impl ExcelLookupApp {
                         }
                     })
                     .body(|body| {
-                        body.rows(row_h, row_count, |mut row| {
+                        body.rows(Self::TABLE_ROW_HEIGHT, row_count, |mut row| {
                             let index = visible_rows
                                 .as_ref()
                                 .map(|rows| rows.index(row.index()))
@@ -497,14 +530,14 @@ impl ExcelLookupApp {
                                         None | Some(CellValue::Empty) => {
                                             ui.label(
                                                 egui::RichText::new("—")
-                                                    .size(13.0)
+                                                    .size(14.0)
                                                     .color(Self::soft()),
                                             );
                                         }
                                         Some(value) => {
                                             ui.label(
                                                 egui::RichText::new(value.display())
-                                                    .size(13.0)
+                                                    .size(14.0)
                                                     .color(Self::ink()),
                                             );
                                         }
@@ -532,14 +565,17 @@ impl ExcelLookupApp {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new(format!("显示前 {} 行 · 可滚动查看完整结果", row_count.min(100)))
-                    .size(12.0)
-                    .color(Self::soft()),
+                egui::RichText::new(format!(
+                    "显示前 {} 行 · 可滚动查看完整结果",
+                    row_count.min(100)
+                ))
+                .size(13.0)
+                .color(Self::soft()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     egui::RichText::new("列宽可拖拽 · 横向可滚动")
-                        .size(12.0)
+                        .size(13.0)
                         .color(Self::soft()),
                 );
             });

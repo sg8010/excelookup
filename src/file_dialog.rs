@@ -430,7 +430,7 @@ impl FileDialog {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     egui::RichText::new(&self.hint)
-                        .size(12.0)
+                        .size(13.0)
                         .color(palette::soft()),
                 );
             });
@@ -441,7 +441,7 @@ impl FileDialog {
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 egui::RichText::new("位置")
-                    .size(12.0)
+                    .size(13.0)
                     .color(palette::soft()),
             );
             for (label, path) in self.places.iter() {
@@ -487,7 +487,7 @@ impl FileDialog {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("筛选")
-                    .size(12.0)
+                    .size(13.0)
                     .color(palette::soft()),
             );
             ui.add(
@@ -560,7 +560,7 @@ impl FileDialog {
                         header.col(|ui| {
                             ui.label(
                                 egui::RichText::new(title)
-                                    .size(12.0)
+                                    .size(13.0)
                                     .strong()
                                     .color(palette::muted()),
                             );
@@ -593,7 +593,7 @@ impl FileDialog {
                             let response = ui
                                 .label(
                                     egui::RichText::new(format!("{mark}{}", entry.name))
-                                        .size(14.0)
+                                        .size(15.0)
                                         .color(color),
                                 )
                                 // 标签默认只响应 hover，会挡住表格行的点击；把点击能力
@@ -609,14 +609,14 @@ impl FileDialog {
                         row.col(|ui| {
                             ui.label(
                                 egui::RichText::new(entry.size_label())
-                                    .size(12.0)
+                                    .size(13.0)
                                     .color(palette::muted()),
                             );
                         });
                         row.col(|ui| {
                             ui.label(
                                 egui::RichText::new(entry.kind_label())
-                                    .size(12.0)
+                                    .size(13.0)
                                     .color(palette::soft()),
                             );
                         });
@@ -695,7 +695,7 @@ impl FileDialog {
                     Some(ext) => format!("保存到 {} · 自动补 .{ext}", self.dir.display()),
                     None => format!("保存到 {}", self.dir.display()),
                 };
-                ui.label(egui::RichText::new(hint).size(12.0).color(palette::soft()));
+                ui.label(egui::RichText::new(hint).size(13.0).color(palette::soft()));
             });
             ui.add_space(6.0);
         }
@@ -703,7 +703,7 @@ impl FileDialog {
         if let Some(error) = &self.error {
             ui.label(
                 egui::RichText::new(error)
-                    .size(12.0)
+                    .size(13.0)
                     .color(palette::danger()),
             );
         } else if let Some(target) = &self.overwrite {
@@ -713,11 +713,11 @@ impl FileDialog {
                 .unwrap_or_default();
             ui.label(
                 egui::RichText::new(format!("文件已存在:{name} — 再点一次「覆盖保存」将覆盖它"))
-                    .size(12.0)
+                    .size(13.0)
                     .color(palette::amber()),
             );
         } else {
-            ui.label(egui::RichText::new(" ").size(12.0));
+            ui.label(egui::RichText::new(" ").size(13.0));
         }
         ui.add_space(6.0);
 
@@ -736,7 +736,7 @@ impl FileDialog {
                     format!("共 {shown} 个项目")
                 }
             };
-            ui.label(egui::RichText::new(tip).size(12.0).color(palette::soft()));
+            ui.label(egui::RichText::new(tip).size(13.0).color(palette::soft()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let label = match (self.purpose, self.overwrite.is_some()) {
                     (Purpose::Save, true) => "覆盖保存",
@@ -782,7 +782,7 @@ fn chip(ui: &mut egui::Ui, text: &str, active: bool) -> egui::Response {
         (palette::white(), palette::muted())
     };
     ui.add(
-        egui::Button::new(egui::RichText::new(text).size(12.0).color(color))
+        egui::Button::new(egui::RichText::new(text).size(13.0).color(color))
             .min_size(egui::vec2(0.0, 26.0))
             .fill(fill)
             .stroke(Stroke::new(
@@ -799,7 +799,7 @@ fn chip(ui: &mut egui::Ui, text: &str, active: bool) -> egui::Response {
 
 fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
-        egui::Button::new(egui::RichText::new(text).size(12.0).color(palette::muted()))
+        egui::Button::new(egui::RichText::new(text).size(13.0).color(palette::muted()))
             .min_size(egui::vec2(0.0, 26.0))
             .fill(palette::white())
             .stroke(Stroke::new(1.0, palette::line_strong()))

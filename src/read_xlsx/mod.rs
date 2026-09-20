@@ -24,7 +24,7 @@ pub mod stream;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use calamine::{open_workbook_auto, Data, Reader, Sheets};
+use calamine::{Data, Reader, Sheets, open_workbook_auto};
 
 use crate::model::{CellValue, Table};
 use stream::StreamRead;
@@ -82,8 +82,8 @@ pub fn read_workbook(path: &Path) -> Result<Vec<(String, Table)>> {
 /// 该表退回 `Range` 路径 —— **不再重开工作簿**,因为 `worksheet_range` 会自己新建
 /// 一个单元格读取器,不受当前表流式读取的影响。
 pub fn read_workbook_opts(path: &Path, opts: ReadOptions) -> Result<Vec<SheetTable>> {
-    let mut workbook = open_workbook_auto(path)
-        .with_context(|| format!("无法打开文件: {}", path.display()))?;
+    let mut workbook =
+        open_workbook_auto(path).with_context(|| format!("无法打开文件: {}", path.display()))?;
 
     let names = workbook.sheet_names().to_vec();
     if names.is_empty() {
@@ -96,17 +96,17 @@ pub fn read_workbook_opts(path: &Path, opts: ReadOptions) -> Result<Vec<SheetTab
         let requested = opts.header_rows.get(index).copied().flatten();
         let mut sheet =
             match stream::read_sheet_with_workbook(&mut workbook, name, requested, opts.preview)? {
-            StreamRead::Done(sheet) => sheet,
-            // chartsheet 等非工作表:与 Range 路径一致地返回空表
-            StreamRead::NotAWorksheet => SheetTable::default(),
-            // 非 xlsx 或结构畸形:本表退回 Range 路径(同一 handle 上新建读取器)
-            StreamRead::Unsupported | StreamRead::Fallback => {
-                let mut range = workbook
-                    .worksheet_range(name)
-                    .with_context(|| format!("读取工作表「{}」失败", name))?;
-                table_from_range(&mut range, requested, opts.preview)
-            }
-        };
+                StreamRead::Done(sheet) => sheet,
+                // chartsheet 等非工作表:与 Range 路径一致地返回空表
+                StreamRead::NotAWorksheet => SheetTable::default(),
+                // 非 xlsx 或结构畸形:本表退回 Range 路径(同一 handle 上新建读取器)
+                StreamRead::Unsupported | StreamRead::Fallback => {
+                    let mut range = workbook
+                        .worksheet_range(name)
+                        .with_context(|| format!("读取工作表「{}」失败", name))?;
+                    table_from_range(&mut range, requested, opts.preview)
+                }
+            };
         sheet.name = name.clone();
         out.push(sheet);
     }
@@ -179,8 +179,8 @@ pub(crate) fn read_sheet_range(
     requested: Option<usize>,
     preview: bool,
 ) -> Result<SheetTable> {
-    let mut workbook = open_workbook_auto(path)
-        .with_context(|| format!("无法打开文件: {}", path.display()))?;
+    let mut workbook =
+        open_workbook_auto(path).with_context(|| format!("无法打开文件: {}", path.display()))?;
     let mut range = workbook
         .worksheet_range(sheet_name)
         .with_context(|| format!("读取工作表「{}」失败", sheet_name))?;
@@ -507,7 +507,10 @@ mod tests {
             ((3, 1), s("b")),
         ];
         assert_eq!(auto(4, 2, &cells).table.headers, vec!["2024", "2024_2"]);
-        assert_eq!(with_header(4, 2, &cells, 1).table.headers, vec!["id", "name"]);
+        assert_eq!(
+            with_header(4, 2, &cells, 1).table.headers,
+            vec!["id", "name"]
+        );
     }
 
     #[test]
@@ -533,8 +536,14 @@ mod tests {
         assert_eq!(data_take_cell(&mut e), CellValue::Text("2024-01-01".into()));
 
         assert_eq!(data_take_cell(&mut Data::Int(5)), CellValue::Number(5.0));
-        assert_eq!(data_take_cell(&mut Data::Float(1.5)), CellValue::Number(1.5));
-        assert_eq!(data_take_cell(&mut Data::Bool(true)), CellValue::Text("TRUE".into()));
+        assert_eq!(
+            data_take_cell(&mut Data::Float(1.5)),
+            CellValue::Number(1.5)
+        );
+        assert_eq!(
+            data_take_cell(&mut Data::Bool(true)),
+            CellValue::Text("TRUE".into())
+        );
         assert_eq!(data_take_cell(&mut Data::Empty), CellValue::Empty);
     }
 }

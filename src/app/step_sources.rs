@@ -27,47 +27,66 @@ impl ExcelLookupApp {
             // 中间列:对调 A/B 按钮(需要整列高度与两侧卡片对齐)
             cols[1].vertical_centered(|ui| {
                 ui.add_space(8.0);
-                let size = egui::vec2(48.0, 48.0);
+                let size = egui::vec2(40.0, 40.0);
                 let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
                 let button_rect = egui::Rect::from_center_size(rect.center(), size);
                 // 圆底 + 双箭头(⇄) + 悬停加深
                 let hovered = ui.rect_contains_pointer(button_rect);
-                let (bg, fg) = if hovered {
-                    (Self::blue_soft(), Self::blue())
+                let (bg, edge, fg) = if hovered {
+                    (Self::blue_soft(), Self::blue(), Self::blue())
                 } else {
-                    (Self::white(), Self::muted())
+                    (Self::white(), Self::line_strong(), Self::muted())
                 };
                 let painter = ui.painter();
-                painter.circle_filled(button_rect.center(), 24.0, bg);
-                painter.circle_stroke(button_rect.center(), 24.0, Stroke::new(1.0, Self::line_strong()));
+                painter.circle_filled(button_rect.center(), 20.0, bg);
+                painter.circle_stroke(button_rect.center(), 20.0, Stroke::new(1.0, edge));
                 let center = button_rect.center();
+                let arrow = Stroke::new(1.8, fg);
                 // 上箭头(右向)
-                let y1 = center.y - 9.0;
+                let y1 = center.y - 7.5;
                 painter.line_segment(
-                    [egui::pos2(center.x - 8.0, y1), egui::pos2(center.x + 8.0, y1)],
-                    Stroke::new(2.0, fg),
+                    [
+                        egui::pos2(center.x - 6.5, y1),
+                        egui::pos2(center.x + 6.5, y1),
+                    ],
+                    arrow,
                 );
                 painter.line_segment(
-                    [egui::pos2(center.x + 8.0, y1), egui::pos2(center.x + 3.0, y1 - 4.0)],
-                    Stroke::new(2.0, fg),
+                    [
+                        egui::pos2(center.x + 6.5, y1),
+                        egui::pos2(center.x + 2.5, y1 - 3.5),
+                    ],
+                    arrow,
                 );
                 painter.line_segment(
-                    [egui::pos2(center.x + 8.0, y1), egui::pos2(center.x + 3.0, y1 + 4.0)],
-                    Stroke::new(2.0, fg),
+                    [
+                        egui::pos2(center.x + 6.5, y1),
+                        egui::pos2(center.x + 2.5, y1 + 3.5),
+                    ],
+                    arrow,
                 );
                 // 下箭头(左向)
-                let y2 = center.y + 9.0;
+                let y2 = center.y + 7.5;
                 painter.line_segment(
-                    [egui::pos2(center.x - 8.0, y2), egui::pos2(center.x + 8.0, y2)],
-                    Stroke::new(2.0, fg),
+                    [
+                        egui::pos2(center.x - 6.5, y2),
+                        egui::pos2(center.x + 6.5, y2),
+                    ],
+                    arrow,
                 );
                 painter.line_segment(
-                    [egui::pos2(center.x - 8.0, y2), egui::pos2(center.x - 3.0, y2 - 4.0)],
-                    Stroke::new(2.0, fg),
+                    [
+                        egui::pos2(center.x - 6.5, y2),
+                        egui::pos2(center.x - 2.5, y2 - 3.5),
+                    ],
+                    arrow,
                 );
                 painter.line_segment(
-                    [egui::pos2(center.x - 8.0, y2), egui::pos2(center.x - 3.0, y2 + 4.0)],
-                    Stroke::new(2.0, fg),
+                    [
+                        egui::pos2(center.x - 6.5, y2),
+                        egui::pos2(center.x - 2.5, y2 + 3.5),
+                    ],
+                    arrow,
                 );
 
                 let any_loading = self.load_active[0] || self.load_active[1];
@@ -89,24 +108,30 @@ impl ExcelLookupApp {
                     resp.on_hover_text("对调 A/B 表");
                 }
                 ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("对调")
-                        .size(12.0)
-                        .color(if hovered { Self::blue() } else { Self::soft() }),
-                );
+                ui.label(egui::RichText::new("对调").size(13.0).color(if hovered {
+                    Self::blue()
+                } else {
+                    Self::soft()
+                }));
             });
             self.ui_source_card(&mut cols[2], Side::Right);
         });
 
         let can_next = self.sources_ready();
-        Self::action_row(ui, "文件只在本机读取，不会上传", NoteTone::Normal, |ui| {
-            if Self::primary_button(ui, "下一步：配置连接  →", 176.0, can_next).clicked() {
-                self.go_to_step(WorkflowStep::Configure);
-            }
-            if Self::secondary_button(ui, "清空数据源", 104.0).clicked() {
-                self.clear_sources();
-            }
-        });
+        Self::action_row(
+            ui,
+            "文件只在本机读取，不会上传",
+            NoteTone::Normal,
+            |ui| {
+                if Self::primary_button(ui, None, "下一步：配置连接  →", 176.0, can_next).clicked()
+                {
+                    self.go_to_step(WorkflowStep::Configure);
+                }
+                if Self::secondary_button(ui, None, "清空数据源", 104.0, true).clicked() {
+                    self.clear_sources();
+                }
+            },
+        );
     }
 
     pub(crate) fn ui_source_card(&mut self, ui: &mut egui::Ui, side: Side) {
@@ -135,124 +160,188 @@ impl ExcelLookupApp {
             Side::Right => ("匹配表", "提供需要带出的字段"),
         };
 
-        Self::card_frame(Self::surface(), Self::line(), 16).show(ui, |ui| {
-            ui.set_min_height(238.0);
-            ui.horizontal(|ui| {
-                Self::letter_badge(ui, side.letter(), accent);
-                ui.add_space(1.0);
-                ui.vertical(|ui| {
+        Self::card_frame().show(ui, |ui| {
+            egui::Frame::new()
+                .inner_margin(egui::Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_min_height(238.0);
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(role.0).size(16.0).strong().color(Self::ink()));
-                        ui.label(egui::RichText::new(role.1).size(13.0).color(Self::muted()));
-                    });
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if loading {
-                        Self::status_badge(ui, "加载中…");
-                    } else if loaded && error.is_none() {
-                        Self::status_badge(ui, "已加载");
-                    }
-                });
-            });
-            ui.add_space(19.0);
-
-            let file_label = if loading {
-                "正在后台读取…".to_owned()
-            } else if loaded {
-                format!("▣  {label}")
-            } else {
-                "选择工作簿".to_owned()
-            };
-            let button_width = ui.available_width();
-            ui.add_enabled_ui(!loading, |ui| {
-                if ui
-                    .add_sized(
-                        [button_width, 39.0],
-                        egui::Button::new(
-                            egui::RichText::new(file_label).strong().color(Self::ink()),
-                        )
-                        .fill(Self::white())
-                        .stroke(Stroke::new(1.0, Self::line_strong()))
-                        .corner_radius(CornerRadius::ZERO),
-                    )
-                    .clicked()
-                {
-                    self.pick_and_load(side);
-                }
-            });
-
-            if loading {
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("大文件解析中,界面保持可操作")
-                        .size(12.0)
-                        .color(Self::muted()),
-                );
-            }
-
-            if loaded && !loading {
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(format!("工作簿 · {rows} 行 · {cols} 列"))
-                        .size(13.0)
-                        .color(Self::muted()),
-                );
-                ui.add_space(17.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("工作表").size(13.0).color(Self::soft()));
-                    ui.add_space(8.0);
-                    let current = sheet_names
-                        .get(sheet_idx)
-                        .cloned()
-                        .unwrap_or_else(|| "未选择".into());
-                    egui::ComboBox::from_id_salt(match side {
-                        Side::Left => "workflow_left_sheet",
-                        Side::Right => "workflow_right_sheet",
-                    })
-                    .selected_text(current)
-                    .width((ui.available_width() - 76.0).max(110.0))
-                    .truncate()
-                    .show_ui(ui, |ui| {
-                        for (index, name) in sheet_names.iter().enumerate() {
-                            if ui.selectable_label(index == sheet_idx, name).clicked() {
-                                self.switch_sheet(side, index);
+                        Self::letter_badge(ui, side.letter(), accent);
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(role.0)
+                                        .size(15.0)
+                                        .strong()
+                                        .color(Self::ink()),
+                                );
+                                ui.label(
+                                    egui::RichText::new(role.1).size(13.0).color(Self::muted()),
+                                );
+                            });
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if loading {
+                                Self::status_badge(
+                                    ui,
+                                    Some(Icon::Loader),
+                                    "加载中…",
+                                    Self::blue_soft(),
+                                    Self::blue(),
+                                );
+                            } else if error.is_some() {
+                                Self::status_badge(
+                                    ui,
+                                    Some(Icon::Warn),
+                                    "读取失败",
+                                    Self::warning_soft(),
+                                    Self::amber(),
+                                );
+                            } else if loaded {
+                                Self::status_badge(
+                                    ui,
+                                    Some(Icon::CheckCircle),
+                                    "已加载",
+                                    Self::teal_soft(),
+                                    Self::teal(),
+                                );
                             }
-                        }
+                        });
                     });
-                    if sheet_names.len() > 1 {
+                    ui.add_space(19.0);
+
+                    let (file_label, file_icon) = if loading {
+                        ("正在后台读取…".to_owned(), Icon::Loader)
+                    } else if loaded {
+                        (label.clone(), Icon::Doc)
+                    } else {
+                        ("选择工作簿".to_owned(), Icon::DocPlus)
+                    };
+                    // 全宽文件按钮:白底描边 + 左图标,外形接近输入框;加载中禁用。
+                    let button_width = ui.available_width();
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(button_width, Self::BUTTON_HEIGHT),
+                        if loading {
+                            egui::Sense::hover()
+                        } else {
+                            egui::Sense::click()
+                        },
+                    );
+                    if ui.is_rect_visible(rect) {
+                        let hovered = response.hovered() && !loading;
+                        let (fill, edge, fg) = if loading {
+                            (Self::surface_subtle(), Self::line(), Self::text_disabled())
+                        } else if hovered {
+                            (Self::blue_soft(), Self::accent_border(), Self::blue())
+                        } else {
+                            (Self::white(), Self::line_strong(), Self::ink())
+                        };
+                        let painter = ui.painter_at(rect);
+                        painter.rect(
+                            rect,
+                            CornerRadius::same(Self::INPUT_RADIUS),
+                            fill,
+                            Stroke::new(1.0, edge),
+                            egui::StrokeKind::Inside,
+                        );
+                        let icon_rect = egui::Rect::from_center_size(
+                            egui::pos2(rect.left() + 12.0 + 8.0, rect.center().y),
+                            egui::vec2(16.0, 16.0),
+                        );
+                        Self::paint_icon(&painter, file_icon, icon_rect, fg);
+                        painter.text(
+                            egui::pos2(icon_rect.right() + 8.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            file_label,
+                            egui::FontId::proportional(15.0),
+                            fg,
+                        );
+                    }
+                    if !loading && response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if !loading && response.clicked() {
+                        self.pick_and_load(side);
+                    }
+
+                    if loading {
+                        ui.add_space(8.0);
                         ui.label(
-                            egui::RichText::new(format!("共 {} 个", sheet_names.len()))
-                                .size(12.0)
+                            egui::RichText::new("大文件解析中,界面保持可操作")
+                                .size(13.0)
                                 .color(Self::muted()),
                         );
                     }
-                });
-                ui.add_space(11.0);
-                self.ui_header_row_picker(ui, side);
-                ui.add_space(13.0);
-                ui.label(
-                    egui::RichText::new(match side {
-                        Side::Left => "✓ 将保留主表全部行",
-                        Side::Right => "✓ 可从匹配表带出所需要的行",
-                    })
-                    .size(12.0)
-                    .color(Self::teal()),
-                );
-            } else if !loading {
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new("选择一个工作簿后，可在这里切换工作表")
-                        .size(13.0)
-                        .color(Self::muted()),
-                );
-            }
 
-            if let Some(error) = &error {
-                if !loading {
-                    ui.add_space(8.0);
-                    ui.colored_label(Self::amber(), format!("⚠ {error}"));
-                }
-            }
+                    if loaded && !loading {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(format!("工作簿 · {rows} 行 · {cols} 列"))
+                                .size(13.0)
+                                .color(Self::muted()),
+                        );
+                        ui.add_space(17.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("工作表")
+                                    .size(13.0)
+                                    .color(Self::muted()),
+                            );
+                            ui.add_space(8.0);
+                            let current = sheet_names
+                                .get(sheet_idx)
+                                .cloned()
+                                .unwrap_or_else(|| "未选择".into());
+                            egui::ComboBox::from_id_salt(match side {
+                                Side::Left => "workflow_left_sheet",
+                                Side::Right => "workflow_right_sheet",
+                            })
+                            .selected_text(current)
+                            .width((ui.available_width() - 76.0).max(110.0))
+                            .truncate()
+                            .show_ui(ui, |ui| {
+                                for (index, name) in sheet_names.iter().enumerate() {
+                                    if ui.selectable_label(index == sheet_idx, name).clicked() {
+                                        self.switch_sheet(side, index);
+                                    }
+                                }
+                            });
+                            if sheet_names.len() > 1 {
+                                ui.label(
+                                    egui::RichText::new(format!("共 {} 个", sheet_names.len()))
+                                        .size(13.0)
+                                        .color(Self::muted()),
+                                );
+                            }
+                        });
+                        ui.add_space(11.0);
+                        self.ui_header_row_picker(ui, side);
+                        ui.add_space(13.0);
+                        ui.label(
+                            egui::RichText::new(match side {
+                                Side::Left => "✓ 将保留主表全部行",
+                                Side::Right => "✓ 可从匹配表带出所需要的行",
+                            })
+                            .size(13.0)
+                            .color(Self::teal()),
+                        );
+                    } else if !loading {
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new("选择一个工作簿后，可在这里切换工作表")
+                                .size(13.0)
+                                .color(Self::muted()),
+                        );
+                    }
+
+                    if let Some(error) = &error
+                        && !loading
+                    {
+                        ui.add_space(8.0);
+                        Self::warn_banner(ui, error);
+                    }
+                });
         });
     }
 
@@ -286,7 +375,11 @@ impl ExcelLookupApp {
             .map(|(_, label)| label.clone())
             .unwrap_or_else(|| "自动".to_owned());
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("列名行").size(13.0).color(Self::soft()));
+            ui.label(
+                egui::RichText::new("列名行")
+                    .size(13.0)
+                    .color(Self::muted()),
+            );
             ui.add_space(8.0);
             egui::ComboBox::from_id_salt(match side {
                 Side::Left => "workflow_left_header_row",
@@ -306,7 +399,7 @@ impl ExcelLookupApp {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new("⚠ 该工作表行数不足，已回退为自动识别列名行")
-                    .size(12.0)
+                    .size(13.0)
                     .color(Self::amber()),
             );
         }
@@ -359,12 +452,15 @@ impl ExcelLookupApp {
             } else {
                 text
             };
-            out.push((Some(index), format!("第 {} 行：{}", first_row + index, text)));
+            out.push((
+                Some(index),
+                format!("第 {} 行：{}", first_row + index, text),
+            ));
         }
-        if let Some(row) = current {
-            if !out.iter().any(|(value, _)| *value == Some(row)) {
-                out.push((Some(row), format!("第 {} 行", first_row + row)));
-            }
+        if let Some(row) = current
+            && !out.iter().any(|(value, _)| *value == Some(row))
+        {
+            out.push((Some(row), format!("第 {} 行", first_row + row)));
         }
         out
     }

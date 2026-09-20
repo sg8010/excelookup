@@ -31,10 +31,7 @@ fn main() {
     let rc = out_dir.join("app.rc");
     std::fs::write(
         &rc,
-        format!(
-            "1 ICON \"{}\"\n",
-            ico.to_str().expect("图标路径需为 UTF-8")
-        ),
+        format!("1 ICON \"{}\"\n", ico.to_str().expect("图标路径需为 UTF-8")),
     )
     .expect("写入 app.rc 失败");
 
@@ -61,10 +58,7 @@ fn main() {
     assert!(status.success(), "windres 编译资源失败");
 
     // 链接进最终 exe
-    println!(
-        "cargo:rustc-link-arg-bin=excelookup={}",
-        obj.display()
-    );
+    println!("cargo:rustc-link-arg-bin=excelookup={}", obj.display());
     // 资源变更时重跑
     println!("cargo:rerun-if-changed=assets/icon.ico");
 }
@@ -85,6 +79,5 @@ fn git_version() -> Option<String> {
 fn github_version() -> Option<String> {
     let tag = std::env::var("GITHUB_REF_NAME").ok()?;
     let version = tag.strip_prefix('v')?;
-    (!version.is_empty() && version.chars().next()?.is_ascii_digit())
-        .then(|| version.to_owned())
+    (!version.is_empty() && version.chars().next()?.is_ascii_digit()).then(|| version.to_owned())
 }

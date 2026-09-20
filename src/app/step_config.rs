@@ -25,9 +25,13 @@ impl ExcelLookupApp {
         if !self.sources_ready() {
             ui.vertical_centered(|ui| {
                 ui.add_space(20.0);
-                ui.label(egui::RichText::new("请先加载 A、B 两个数据源").size(16.0).strong());
+                ui.label(
+                    egui::RichText::new("请先加载 A、B 两个数据源")
+                        .size(16.0)
+                        .strong(),
+                );
                 ui.add_space(12.0);
-                if Self::primary_button(ui, "返回数据源", 120.0, true).clicked() {
+                if Self::primary_button(ui, None, "返回数据源", 120.0, true).clicked() {
                     self.go_to_step(WorkflowStep::Sources);
                 }
             });
@@ -36,7 +40,7 @@ impl ExcelLookupApp {
 
         let left_headers = self.left.cur_headers();
         let right_headers = self.right.cur_headers();
-        Self::sub_panel(ui, |ui| {
+        Self::card(ui, |ui| {
             ui.columns(3, |cols| {
                 cols[0].vertical(|ui| {
                     ui.label(
@@ -81,7 +85,7 @@ impl ExcelLookupApp {
                     ui.add_space(3.0);
                     ui.label(
                         egui::RichText::new(self.join_type.hint())
-                            .size(12.0)
+                            .size(13.0)
                             .color(Self::soft()),
                     );
                 });
@@ -94,7 +98,12 @@ impl ExcelLookupApp {
                     );
                     ui.add_space(7.0);
                     let before = self.right_key_col;
-                    Self::col_combo(ui, "workflow_b_key", &right_headers, &mut self.right_key_col);
+                    Self::col_combo(
+                        ui,
+                        "workflow_b_key",
+                        &right_headers,
+                        &mut self.right_key_col,
+                    );
                     // B 匹配列默认不带出:换键时把新键从输出列剔除,之后用户可手动勾上
                     if self.right_key_col != before
                         && let Some(key) = self.right_key_col
@@ -105,8 +114,8 @@ impl ExcelLookupApp {
             });
         });
 
-        ui.add_space(13.0);
-        Self::sub_panel(ui, |ui| {
+        ui.add_space(Self::SECTION_GAP);
+        Self::card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
                     egui::RichText::new("A 输出列")
@@ -116,7 +125,7 @@ impl ExcelLookupApp {
                 );
                 ui.label(
                     egui::RichText::new("默认全选，点击可取消；取消匹配列的输出不影响匹配")
-                        .size(12.0)
+                        .size(13.0)
                         .color(Self::soft()),
                 );
             });
@@ -153,11 +162,7 @@ impl ExcelLookupApp {
                     } else {
                         "未选择 A 输出列"
                     };
-                    ui.label(
-                        egui::RichText::new(note)
-                            .size(12.0)
-                            .color(Self::soft()),
-                    );
+                    ui.label(egui::RichText::new(note).size(13.0).color(Self::soft()));
                 }
             });
             if let Some(edited) = edited {
@@ -165,14 +170,19 @@ impl ExcelLookupApp {
             }
         });
 
-        ui.add_space(13.0);
-        Self::sub_panel(ui, |ui| {
+        ui.add_space(Self::SECTION_GAP);
+        Self::card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("B 输出列").size(13.0).strong().color(Self::muted()));
+                ui.label(
+                    egui::RichText::new("B 输出列")
+                        .size(13.0)
+                        .strong()
+                        .color(Self::muted()),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new("选择需要带入结果的字段；B 匹配列默认不带出")
-                            .size(12.0)
+                            .size(13.0)
                             .color(Self::soft()),
                     );
                 });
@@ -185,7 +195,7 @@ impl ExcelLookupApp {
                     key_unset = true;
                     ui.label(
                         egui::RichText::new("请先选择 B 匹配列，再勾选输出字段")
-                            .size(12.0)
+                            .size(13.0)
                             .color(Self::amber()),
                     );
                 }
@@ -205,7 +215,7 @@ impl ExcelLookupApp {
                 if right_key.is_some() && self.right_pick_cols.is_empty() {
                     ui.label(
                         egui::RichText::new("未选择 B 输出列")
-                            .size(12.0)
+                            .size(13.0)
                             .color(Self::soft()),
                     );
                 }
@@ -217,14 +227,14 @@ impl ExcelLookupApp {
                 Self::toggle_switch(ui, &mut self.normalize_keys, "键宽松匹配");
                 ui.label(
                     egui::RichText::new("数字/文本互认，忽略首尾空格")
-                        .size(12.0)
+                        .size(13.0)
                         .color(Self::soft()),
                 );
                 ui.add_space(15.0);
                 Self::toggle_switch(ui, &mut self.bracket_fold, "括号归一化");
                 ui.label(
                     egui::RichText::new("中文（）与英文()互认")
-                        .size(12.0)
+                        .size(13.0)
                         .color(Self::soft()),
                 );
                 ui.add_space(15.0);
@@ -232,13 +242,13 @@ impl ExcelLookupApp {
                 if self.expand_dup {
                     ui.label(
                         egui::RichText::new("B 同键多行全部带出")
-                            .size(12.0)
+                            .size(13.0)
                             .color(Self::soft()),
                     );
                 } else {
                     ui.label(
                         egui::RichText::new("B 同键多行只取第一条（VLOOKUP 风格）")
-                            .size(12.0)
+                            .size(13.0)
                             .color(Self::amber()),
                     );
                 }
@@ -248,7 +258,7 @@ impl ExcelLookupApp {
                 Self::toggle_switch(ui, &mut self.case_suffix, "忽略案号分支后缀");
                 ui.label(
                     egui::RichText::new("匹配时忽略末尾的之一、之十二等，保留原值")
-                        .size(12.0)
+                        .size(13.0)
                         .color(Self::soft()),
                 );
             });
@@ -292,6 +302,7 @@ impl ExcelLookupApp {
             };
             if Self::primary_button(
                 ui,
+                None,
                 label,
                 180.0,
                 keys_ready && output_ready && key_output_ready && !busy,
@@ -300,16 +311,23 @@ impl ExcelLookupApp {
             {
                 self.run_join(ui.ctx().clone());
             }
-            if Self::secondary_button(ui, "上一步", 72.0).clicked() {
+            if Self::secondary_button(ui, None, "上一步", 72.0, true).clicked() {
                 self.go_to_step(WorkflowStep::Sources);
             }
-            if self.result.is_some() && Self::secondary_button(ui, "清空结果", 80.0).clicked() {
+            if self.result.is_some()
+                && Self::secondary_button(ui, None, "清空结果", 80.0, true).clicked()
+            {
                 self.clear_result();
             }
         });
     }
 
-    pub(crate) fn col_combo(ui: &mut egui::Ui, id: &str, headers: &[String], sel: &mut Option<usize>) {
+    pub(crate) fn col_combo(
+        ui: &mut egui::Ui,
+        id: &str,
+        headers: &[String],
+        sel: &mut Option<usize>,
+    ) {
         if headers.is_empty() {
             ui.add_enabled(false, egui::Button::new("—"));
             return;
@@ -324,48 +342,5 @@ impl ExcelLookupApp {
                     ui.selectable_value(sel, Some(index), name);
                 }
             });
-    }
-
-    pub(crate) fn toggle_chip(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
-        let fill = if selected {
-            Self::blue_soft()
-        } else {
-            Self::white()
-        };
-        let stroke = if selected {
-            Color32::from_rgb(197, 216, 243)
-        } else {
-            Self::line_strong()
-        };
-        let text = if selected {
-            egui::RichText::new(format!("• {label}")).size(13.0).color(Self::blue())
-        } else {
-            egui::RichText::new(format!("＋ {label}")).size(13.0).color(Self::muted())
-        };
-        ui.add(
-            egui::Button::new(text)
-                .min_size(egui::vec2(0.0, 29.0))
-                .fill(fill)
-                .stroke(Stroke::new(1.0, stroke))
-                .corner_radius(CornerRadius::ZERO),
-        )
-    }
-
-    pub(crate) fn toggle_switch(ui: &mut egui::Ui, value: &mut bool, label: &str) {
-        ui.horizontal(|ui| {
-            let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 18.0), egui::Sense::click());
-            if response.clicked() {
-                *value = !*value;
-            }
-            let fill = if *value { Self::teal() } else { Self::line_strong() };
-            ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
-            let knob = if *value {
-                egui::pos2(rect.right() - 8.0, rect.center().y)
-            } else {
-                egui::pos2(rect.left() + 8.0, rect.center().y)
-            };
-            ui.painter().circle_filled(knob, 6.0, Color32::WHITE);
-            ui.label(egui::RichText::new(label).size(13.0).color(Self::muted()));
-        });
     }
 }

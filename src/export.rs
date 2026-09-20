@@ -64,11 +64,7 @@ pub fn write_joined_xlsx_with_progress(
     path: &Path,
     mut on_progress: impl FnMut(ExportProgress),
 ) -> Result<()> {
-    let source = JoinedExport {
-        table,
-        left,
-        right,
-    };
+    let source = JoinedExport { table, left, right };
     write_export_with_progress(&source, path, &mut on_progress)
 }
 
@@ -199,8 +195,7 @@ fn estimate_column_widths(source: &impl ExportSource) -> Vec<usize> {
     for row in 0..source.row_count().min(COLUMN_WIDTH_SAMPLE_ROWS) {
         for column in 0..widths.len() {
             if let Some(cell) = source.cell(row, column) {
-                widths[column] =
-                    widths[column].max(cell_display_width(cell).min(MAX_COLUMN_WIDTH));
+                widths[column] = widths[column].max(cell_display_width(cell).min(MAX_COLUMN_WIDTH));
             }
         }
         if widths.iter().all(|width| *width >= MAX_COLUMN_WIDTH) {
@@ -271,7 +266,10 @@ mod tests {
         let mut events = Vec::new();
         write_xlsx_with_progress(&table, &path, |progress| events.push(progress)).unwrap();
 
-        assert_eq!(events.first().map(|event| event.phase), Some(ExportPhase::Writing));
+        assert_eq!(
+            events.first().map(|event| event.phase),
+            Some(ExportPhase::Writing)
+        );
         assert_eq!(
             events
                 .iter()
@@ -279,7 +277,10 @@ mod tests {
                 .map(|event| event.total_rows),
             Some(2)
         );
-        assert_eq!(events.last().map(|event| event.phase), Some(ExportPhase::Saving));
+        assert_eq!(
+            events.last().map(|event| event.phase),
+            Some(ExportPhase::Saving)
+        );
         assert!(path.is_file());
         std::fs::remove_file(path).unwrap();
     }

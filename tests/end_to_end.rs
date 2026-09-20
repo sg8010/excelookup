@@ -4,13 +4,13 @@ mod support;
 
 use std::path::PathBuf;
 
-use calamine::{open_workbook_auto, Data, Reader};
+use calamine::{Data, Reader, open_workbook_auto};
 use rust_xlsxwriter::Workbook;
 
 use excelookup_lib::export::write_joined_xlsx;
-use excelookup_lib::join::{join, JoinSpec, JoinType, KeyMode};
+use excelookup_lib::join::{JoinSpec, JoinType, KeyMode, join};
 use excelookup_lib::model::CellValue;
-use excelookup_lib::read_xlsx::{read_sheet_opts, read_workbook, read_workbook_opts, ReadOptions};
+use excelookup_lib::read_xlsx::{ReadOptions, read_sheet_opts, read_workbook, read_workbook_opts};
 
 use support::TempDir;
 
@@ -89,10 +89,7 @@ fn end_to_end_left_join_real_xlsx() {
         res.table.cell(&left, &right, 0, 2),
         Some(&CellValue::Text("工程部".into()))
     );
-    assert_eq!(
-        res.table.cell(&left, &right, 1, 2),
-        Some(&CellValue::Empty)
-    ); // 李四未匹配
+    assert_eq!(res.table.cell(&left, &right, 1, 2), Some(&CellValue::Empty)); // 李四未匹配
     assert_eq!(
         res.table.cell(&left, &right, 2, 2),
         Some(&CellValue::Text("产品部".into()))
@@ -154,9 +151,13 @@ fn end_to_end_same_file_two_sheets() {
             for (i, h) in ["订单号", "客户", "金额"].iter().enumerate() {
                 s.write_string(0, i as u16, *h).unwrap();
             }
-            for (r, row) in [("A001", "张三", "100"), ("A002", "李四", "250"), ("A003", "王五", "80")]
-                .iter()
-                .enumerate()
+            for (r, row) in [
+                ("A001", "张三", "100"),
+                ("A002", "李四", "250"),
+                ("A003", "王五", "80"),
+            ]
+            .iter()
+            .enumerate()
             {
                 s.write_string((r + 1) as u32, 0, row.0).unwrap();
                 s.write_string((r + 1) as u32, 1, row.1).unwrap();
@@ -169,7 +170,10 @@ fn end_to_end_same_file_two_sheets() {
             for (i, h) in ["客户", "城市"].iter().enumerate() {
                 s.write_string(0, i as u16, *h).unwrap();
             }
-            for (r, row) in [("张三", "北京"), ("李四", "上海"), ("赵六", "广州")].iter().enumerate() {
+            for (r, row) in [("张三", "北京"), ("李四", "上海"), ("赵六", "广州")]
+                .iter()
+                .enumerate()
+            {
                 s.write_string((r + 1) as u32, 0, row.0).unwrap();
                 s.write_string((r + 1) as u32, 1, row.1).unwrap();
             }
@@ -226,15 +230,25 @@ fn end_to_end_header_row_skips_merged_title() {
         let mut wb = Workbook::new();
         let s = wb.add_worksheet();
         s.set_name("销售").unwrap();
-        s.merge_range(0, 0, 0, 2, "2024 年销售统计", &rust_xlsxwriter::Format::new())
-            .unwrap();
+        s.merge_range(
+            0,
+            0,
+            0,
+            2,
+            "2024 年销售统计",
+            &rust_xlsxwriter::Format::new(),
+        )
+        .unwrap();
         for (i, h) in ["id", "名称", "金额"].iter().enumerate() {
             s.write_string(1, i as u16, *h).unwrap();
         }
-        for (r, (id, name, amount)) in
-            [(1001.0, "苹果", 12.5), (1002.0, "香蕉", 7.0), (1003.0, "橙子", 3.25)]
-                .iter()
-                .enumerate()
+        for (r, (id, name, amount)) in [
+            (1001.0, "苹果", 12.5),
+            (1002.0, "香蕉", 7.0),
+            (1003.0, "橙子", 3.25),
+        ]
+        .iter()
+        .enumerate()
         {
             let row = (r + 2) as u32;
             s.write_number(row, 0, *id).unwrap();
@@ -426,9 +440,15 @@ fn zero_left_output_columns_export_only_right_columns() {
     let actual = workbook.worksheet_range_at(0).unwrap().unwrap();
     assert_eq!(actual.get_size(), (4, 1));
     assert_eq!(actual.get_value((0, 0)), Some(&Data::String("部门".into())));
-    assert_eq!(actual.get_value((1, 0)), Some(&Data::String("工程部".into())));
+    assert_eq!(
+        actual.get_value((1, 0)),
+        Some(&Data::String("工程部".into()))
+    );
     assert_eq!(actual.get_value((2, 0)), Some(&Data::Empty));
-    assert_eq!(actual.get_value((3, 0)), Some(&Data::String("产品部".into())));
+    assert_eq!(
+        actual.get_value((3, 0)),
+        Some(&Data::String("产品部".into()))
+    );
 }
 
 /// 全部越界的 A 输出列等于没选:导出侧不出现空列。
@@ -459,7 +479,13 @@ fn out_of_range_left_output_columns_export_without_empty_columns() {
     let actual = workbook.worksheet_range_at(0).unwrap().unwrap();
     assert_eq!(actual.get_size(), (4, 1));
     assert_eq!(actual.get_value((0, 0)), Some(&Data::String("部门".into())));
-    assert_eq!(actual.get_value((1, 0)), Some(&Data::String("工程部".into())));
+    assert_eq!(
+        actual.get_value((1, 0)),
+        Some(&Data::String("工程部".into()))
+    );
     assert_eq!(actual.get_value((2, 0)), Some(&Data::Empty));
-    assert_eq!(actual.get_value((3, 0)), Some(&Data::String("产品部".into())));
+    assert_eq!(
+        actual.get_value((3, 0)),
+        Some(&Data::String("产品部".into()))
+    );
 }

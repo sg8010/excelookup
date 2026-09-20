@@ -196,7 +196,9 @@ impl ExcelLookupApp {
             self.dialog = Some(ActiveDialog { request, dialog });
         }
         // 2. 已显示的对话框:画一帧并处理结果
-        let Some(active) = &mut self.dialog else { return };
+        let Some(active) = &mut self.dialog else {
+            return;
+        };
         let action = active.dialog.ui(ctx);
         // 记住用户停留的目录,下次从这里打开(即便这次取消了)
         self.last_dir = Some(active.dialog.dir().to_path_buf());
@@ -293,7 +295,7 @@ impl ExcelLookupApp {
         sheet_idx: usize,
         header_rows: &[Option<usize>],
     ) -> bool {
-        let success = {
+        {
             let src = match side {
                 Side::Left => &mut self.left,
                 Side::Right => &mut self.right,
@@ -313,9 +315,7 @@ impl ExcelLookupApp {
                 },
                 Some(index) if index == current_idx => index,
                 Some(index) => {
-                    if index >= sheet.preview.len()
-                        || index >= sheet.preview_non_empty.len()
-                    {
+                    if index >= sheet.preview.len() || index >= sheet.preview_non_empty.len() {
                         return false;
                     }
                     if sheet.preview_non_empty[index] {
@@ -338,10 +338,7 @@ impl ExcelLookupApp {
                 {
                     return false;
                 }
-                let old_table = std::mem::replace(
-                    &mut sheet.table,
-                    Arc::new(Table::default()),
-                );
+                let old_table = std::mem::replace(&mut sheet.table, Arc::new(Table::default()));
                 let mut table = match Arc::try_unwrap(old_table) {
                     Ok(table) => table,
                     Err(old_table) => {
@@ -372,10 +369,8 @@ impl ExcelLookupApp {
                     prefix_rows.extend(old_rows);
                     table.rows = prefix_rows;
                 }
-                table.headers = Self::headers_from_preview(
-                    &sheet.preview[target_idx],
-                    table.col_count(),
-                );
+                table.headers =
+                    Self::headers_from_preview(&sheet.preview[target_idx], table.col_count());
                 sheet.table = Arc::new(table);
                 sheet.used_header_row = Some(target_idx);
             }
@@ -384,8 +379,7 @@ impl ExcelLookupApp {
             requested_rows.resize(sheet_count, None);
             src.header_rows = requested_rows;
             true
-        };
-        success
+        }
     }
 
     pub(crate) fn start_load_request(
@@ -420,36 +414,30 @@ impl ExcelLookupApp {
         }
         let tx = self.load_tx.as_ref().expect("load_tx 已初始化").clone();
         // 只重读当前表时,先在主线程记住名称;后台线程无需访问 GUI 状态。
-        let sheet_name = sheet_idx.and_then(|sheet_idx| match side {
-            Side::Left => self.left.sheets.get(sheet_idx),
-            Side::Right => self.right.sheets.get(sheet_idx),
-        })
-        .map(|sheet| sheet.name.clone());
+        let sheet_name = sheet_idx
+            .and_then(|sheet_idx| match side {
+                Side::Left => self.left.sheets.get(sheet_idx),
+                Side::Right => self.right.sheets.get(sheet_idx),
+            })
+            .map(|sheet| sheet.name.clone());
         // 立即刷新一次 UI 显示"加载中…"(否则要等下次交互才重绘)
         ctx.request_repaint();
         // 线程只依赖 lib + repaint 句柄(不碰 GUI 状态),成功后数据 move 回主线程,不 clone。
         // catch_unwind:即使解析 panic 也发回错误消息,避免 UI 永远停在"加载中"。
         std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(|| {
-                match (sheet_idx, sheet_name.as_deref()) {
-                    (Some(sheet_idx), Some(sheet_name)) => {
-                        let requested = header_rows.get(sheet_idx).copied().flatten();
-                        excelookup_lib::read_xlsx::read_sheet_opts(
-                            &path,
-                            sheet_name,
-                            requested,
-                            true,
-                        )
+            let result = std::panic::catch_unwind(|| match (sheet_idx, sheet_name.as_deref()) {
+                (Some(sheet_idx), Some(sheet_name)) => {
+                    let requested = header_rows.get(sheet_idx).copied().flatten();
+                    excelookup_lib::read_xlsx::read_sheet_opts(&path, sheet_name, requested, true)
                         .map(|sheet| vec![sheet])
-                    }
-                    _ => excelookup_lib::read_xlsx::read_workbook_opts(
-                        &path,
-                        ReadOptions {
-                            header_rows: header_rows.clone(),
-                            preview: true,
-                        },
-                    ),
                 }
+                _ => excelookup_lib::read_xlsx::read_workbook_opts(
+                    &path,
+                    ReadOptions {
+                        header_rows: header_rows.clone(),
+                        preview: true,
+                    },
+                ),
             })
             .map_err(|_| "读取过程发生内部错误（已中止）".to_owned())
             .and_then(|r| r.map_err(|e| format!("{e}")));
@@ -776,7 +764,11 @@ impl ExcelLookupApp {
     }
 
     /// 重复键展开超出上限时的诊断文案:标题 + 数据诊断 + 排查步骤。
-    pub(crate) fn limit_exceeded_message(limit: &JoinLimitExceeded, a_rows: usize, b_rows: usize) -> String {
+    pub(crate) fn limit_exceeded_message(
+        limit: &JoinLimitExceeded,
+        a_rows: usize,
+        b_rows: usize,
+    ) -> String {
         let estimate = limit.estimate;
         // 单位自适应:≥1 亿用亿,≥1 万用万,否则原样
         let fmt = |n: usize| -> String {
@@ -809,7 +801,10 @@ impl ExcelLookupApp {
                 fmt(estimate.distinct_keys),
                 fmt(estimate.max_dup)
             ));
-            lines.push("· 原因:匹配列很可能选成了“分类/枚举”类列(如省份、状态、类型),而非唯一编号列。".into());
+            lines.push(
+                "· 原因:匹配列很可能选成了“分类/枚举”类列(如省份、状态、类型),而非唯一编号列。"
+                    .into(),
+            );
         } else if estimate.max_dup > 1000 {
             lines.push(format!(
                 "· B 表键列存在单键重复 {} 次的极端值(去重后共 {} 个键)。",

@@ -164,10 +164,7 @@ pub fn has_output_columns(
         None => left_col_count > 0,
         Some(columns) => columns.iter().any(|&column| column < left_col_count),
     };
-    left_selected
-        || right_pick
-            .iter()
-            .any(|&column| column < right_col_count)
+    left_selected || right_pick.iter().any(|&column| column < right_col_count)
 }
 
 /// 输出里是否至少保留了一列匹配列(A 匹配列或 B 匹配列)。
@@ -1069,9 +1066,15 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(joined_cell(&r.table, &a, &b, 0, 2), Some(&CellValue::Text("eng".into())));
+        assert_eq!(
+            joined_cell(&r.table, &a, &b, 0, 2),
+            Some(&CellValue::Text("eng".into()))
+        );
         assert_eq!(joined_cell(&r.table, &a, &b, 1, 2), Some(&CellValue::Empty)); // bob 未匹配
-        assert_eq!(joined_cell(&r.table, &a, &b, 2, 2), Some(&CellValue::Text("ops".into())));
+        assert_eq!(
+            joined_cell(&r.table, &a, &b, 2, 2),
+            Some(&CellValue::Text("ops".into()))
+        );
         assert_eq!(r.left_matched, 2);
     }
 
@@ -1081,8 +1084,14 @@ mod tests {
         let b = tbl(&["id", "v"], &[&["2", "x"], &["3", "y"]]);
         let r = join(&a, &b, &spec(JoinType::Inner, 0, 0, 1, KeyMode::EXACT));
         assert_eq!(r.table.row_count(), 2);
-        assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("x".into())));
-        assert_eq!(joined_cell(&r.table, &a, &b, 1, 1), Some(&CellValue::Text("y".into())));
+        assert_eq!(
+            joined_cell(&r.table, &a, &b, 0, 1),
+            Some(&CellValue::Text("x".into()))
+        );
+        assert_eq!(
+            joined_cell(&r.table, &a, &b, 1, 1),
+            Some(&CellValue::Text("y".into()))
+        );
         // inner:未命中行被丢弃,输出全为命中行
         assert_eq!(hits(&r), vec![true, true]);
     }
@@ -1104,8 +1113,14 @@ mod tests {
         let b = tbl(&["id", "v"], &[&["1", "a"], &["1", "b"]]);
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT));
         assert_eq!(r.table.row_count(), 2);
-        assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("a".into())));
-        assert_eq!(joined_cell(&r.table, &a, &b, 1, 1), Some(&CellValue::Text("b".into())));
+        assert_eq!(
+            joined_cell(&r.table, &a, &b, 0, 1),
+            Some(&CellValue::Text("a".into()))
+        );
+        assert_eq!(
+            joined_cell(&r.table, &a, &b, 1, 1),
+            Some(&CellValue::Text("b".into()))
+        );
         // 展开的两行都算命中
         assert_eq!(hits(&r), vec![true, true]);
         assert_eq!(r.left_matched, 1);
@@ -1121,7 +1136,10 @@ mod tests {
         sp.expand_dup = false;
         let r = join(&a, &b, &sp);
         assert_eq!(r.table.row_count(), 1);
-        assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("a".into())));
+        assert_eq!(
+            joined_cell(&r.table, &a, &b, 0, 1),
+            Some(&CellValue::Text("a".into()))
+        );
         assert_eq!(hits(&r), vec![true]);
         assert_eq!(r.right_matched_rows, 1); // 只算实际用到的一条 B
     }
@@ -1267,7 +1285,10 @@ mod tests {
         );
         assert_eq!(r.table.row_count(), 1);
         assert_eq!(r.table.headers, vec!["k1", "k2", "v", "w"]);
-        assert_eq!(joined_cell(&r.table, &a, &b, 0, 3), Some(&CellValue::Text("r1".into())));
+        assert_eq!(
+            joined_cell(&r.table, &a, &b, 0, 3),
+            Some(&CellValue::Text("r1".into()))
+        );
     }
 
     #[test]
@@ -1280,11 +1301,17 @@ mod tests {
         ]);
         let r = join(&a, &tb, &spec(JoinType::Left, 0, 0, 1, KeyMode::NORMALIZE));
         assert_eq!(r.table.row_count(), 1);
-        assert_eq!(joined_cell(&r.table, &a, &tb, 0, 1), Some(&CellValue::Text("num".into())));
+        assert_eq!(
+            joined_cell(&r.table, &a, &tb, 0, 1),
+            Some(&CellValue::Text("num".into()))
+        );
 
         // Exact 下数字 123 ≠ 文本 "123"
         let r2 = join(&a, &tb, &spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT));
-        assert_eq!(joined_cell(&r2.table, &a, &tb, 0, 1), Some(&CellValue::Empty));
+        assert_eq!(
+            joined_cell(&r2.table, &a, &tb, 0, 1),
+            Some(&CellValue::Empty)
+        );
     }
 
     #[test]
@@ -1296,7 +1323,10 @@ mod tests {
             CellValue::Text("number".into()),
         ]);
         let result = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::NORMALIZE));
-        assert_eq!(joined_cell(&result.table, &a, &b, 0, 1), Some(&CellValue::Empty));
+        assert_eq!(
+            joined_cell(&result.table, &a, &b, 0, 1),
+            Some(&CellValue::Empty)
+        );
     }
 
     #[test]
@@ -1307,7 +1337,10 @@ mod tests {
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, KeyMode::EXACT));
         assert_eq!(r.table.row_count(), 2);
         assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Empty));
-        assert_eq!(joined_cell(&r.table, &a, &b, 1, 1), Some(&CellValue::Text("x".into())));
+        assert_eq!(
+            joined_cell(&r.table, &a, &b, 1, 1),
+            Some(&CellValue::Text("x".into()))
+        );
     }
 
     #[test]
@@ -1329,7 +1362,10 @@ mod tests {
         );
         assert_eq!(r.table.headers, vec!["id", "x", "y"]);
         assert_eq!(r.table.row_count(), 1);
-        assert_eq!(joined_cell(&r.table, &a, &b, 0, 2), Some(&CellValue::Text("20".into())));
+        assert_eq!(
+            joined_cell(&r.table, &a, &b, 0, 2),
+            Some(&CellValue::Text("20".into()))
+        );
     }
 
     #[test]
@@ -1448,7 +1484,10 @@ mod tests {
         };
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m));
         assert_eq!(r.table.row_count(), 1);
-        assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("x".into())));
+        assert_eq!(
+            joined_cell(&r.table, &a, &b, 0, 1),
+            Some(&CellValue::Text("x".into()))
+        );
 
         // 关闭括号归一化则不匹配
         let m2 = KeyMode {
@@ -1458,7 +1497,10 @@ mod tests {
         };
         let r2 = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m2));
         assert_eq!(r2.table.row_count(), 1);
-        assert_eq!(joined_cell(&r2.table, &a, &b, 0, 1), Some(&CellValue::Empty));
+        assert_eq!(
+            joined_cell(&r2.table, &a, &b, 0, 1),
+            Some(&CellValue::Empty)
+        );
     }
 
     #[test]
@@ -1473,7 +1515,10 @@ mod tests {
         };
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m));
         assert_eq!(r.table.row_count(), 1);
-        assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("hit".into())));
+        assert_eq!(
+            joined_cell(&r.table, &a, &b, 0, 1),
+            Some(&CellValue::Text("hit".into()))
+        );
     }
 
     #[test]
@@ -1487,7 +1532,10 @@ mod tests {
             case_suffix: false,
         };
         let r = join(&a, &b, &spec(JoinType::Left, 0, 0, 1, m));
-        assert_eq!(joined_cell(&r.table, &a, &b, 0, 1), Some(&CellValue::Text("x".into())));
+        assert_eq!(
+            joined_cell(&r.table, &a, &b, 0, 1),
+            Some(&CellValue::Text("x".into()))
+        );
     }
 
     #[test]

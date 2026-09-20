@@ -438,10 +438,7 @@ fn workbook_fallback_keeps_later_sheets_correct() {
     assert_eq!(shift.table.cell(0, 1), Some(&CellValue::Number(1.0)));
     let after = &actual[2];
     assert_eq!(after.name, "after");
-    assert_eq!(
-        after.table.cell(0, 0),
-        Some(&CellValue::Text("z".into()))
-    );
+    assert_eq!(after.table.cell(0, 0), Some(&CellValue::Text("z".into())));
     assert_eq!(after.table.cell(1, 0), Some(&CellValue::Number(7.0)));
 }
 
@@ -526,20 +523,20 @@ fn late_left_shift_falls_back_to_range() {
         auto.preview_non_empty, range.preview_non_empty,
         "预览非空标记不同"
     );
-    assert_eq!(auto.used_header_row, range.used_header_row, "实际列名行不同");
-    assert_eq!(auto.auto_header_row, range.auto_header_row, "自动列名行不同");
     assert_eq!(
-        auto.first_row_number, range.first_row_number,
-        "首行号不同"
+        auto.used_header_row, range.used_header_row,
+        "实际列名行不同"
     );
+    assert_eq!(
+        auto.auto_header_row, range.auto_header_row,
+        "自动列名行不同"
+    );
+    assert_eq!(auto.first_row_number, range.first_row_number, "首行号不同");
 
     // 钉死错列这一失效形态:Range 口径下首条数据的 B 列是空,值从 C 列起
     assert_eq!(auto.table.cell(0, 0), Some(&CellValue::Empty));
     assert_eq!(auto.table.cell(0, 1), Some(&CellValue::Number(1.0)));
-    assert_eq!(
-        auto.table.cell(0, 2),
-        Some(&CellValue::Text("张三".into()))
-    );
+    assert_eq!(auto.table.cell(0, 2), Some(&CellValue::Text("张三".into())));
 }
 
 /// 未知扩展名 / 无扩展名的 xlsx 也要被判成流式路径(内容探测,不看扩展名)。
